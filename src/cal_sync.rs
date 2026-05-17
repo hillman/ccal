@@ -157,10 +157,19 @@ fn refresh(
         stats.push(st);
     }
 
+    // Real feeds dupe heavily: the same event subscribed via two calendars,
+    // and recurring master/override pairs. Collapse anything identical in
+    // start, end and summary (sort so exact dupes are adjacent, then
+    // `dedup_by` keeps the first). Cross-calendar dupes are intentionally
+    // merged — a glance agenda wants one row, not "in 2 calendars".
     all.sort_by(|a, b| {
         a.start
             .cmp(&b.start)
+            .then_with(|| a.end.cmp(&b.end))
             .then_with(|| a.summary.cmp(&b.summary))
+    });
+    all.dedup_by(|a, b| {
+        a.start == b.start && a.end == b.end && a.summary == b.summary
     });
 
     *occurrences.lock().unwrap_or_else(|e| e.into_inner()) = all;
