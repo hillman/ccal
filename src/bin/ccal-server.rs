@@ -117,9 +117,19 @@ async fn main() -> Result<()> {
         // sync code, the existing `serve_peer` path does the rest.
         let doc = doc_for(&app, &docid).await?;
         let ct = CancellationToken::new();
+        // rmcp's default reaps an idle MCP session after 300s
+        // (`SessionConfig::keep_alive`), after which the client's cached
+        // session id 404s with "Session not found". An interactive
+        // assistant routinely goes minutes between notes calls, so the
+        // 5-min default fired constantly. Stretch it to 24h: still a
+        // safety net against zombie sessions from silently-dropped
+        // connections, but long enough that a live assistant session
+        // never trips it.
+        let mut sessions = LocalSessionManager::default();
+        sessions.session_config.keep_alive = Some(Duration::from_secs(24 * 60 * 60));
         let svc = StreamableHttpService::new(
             move || Ok(mcp::Ccal::new(doc.clone())),
-            Arc::new(LocalSessionManager::default()),
+            Arc::new(sessions),
             StreamableHttpServerConfig::default()
                 .with_cancellation_token(ct.child_token())
                 // The bearer gate + network layer (Tailscale/TLS) is the
