@@ -1,22 +1,33 @@
 name: release
 
-# Push a version tag → build the macOS (Apple Silicon) binaries and attach
-# them to a public GitHub Release with anonymous download links.
+# Two ways to run:
+#   1. Push a version tag → publish a public GitHub Release.
+#        git tag v0.1.0 && git push origin v0.1.0
+#   2. Actions tab → "release" → "Run workflow" (manual / workflow_dispatch):
+#        - leave "tag" empty   → just build, upload a run artifact (no Release)
+#        - set  "tag" e.g. v0.1.0 → build AND publish that Release/tag
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+# Note: the manual "Run workflow" button only appears once this file is on
+# the default branch AND Actions is enabled in repo Settings → Actions.
 #
 # The binaries are unsigned: see the quarantine note in the release body.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create & publish (empty = build artifact only, no Release)"
+        required: false
+        default: ""
 
 permissions:
   contents: write # needed to create the Release and upload assets
 
 jobs:
   macos:
-    name: build & release (aarch64-apple-darwin)
+    name: build (aarch64-apple-darwin)
     # macos-14 runners are Apple Silicon, so the default host target already
     # is aarch64-apple-darwin — no cross-compilation needed.
     runs-on: macos-14
@@ -31,6 +42,21 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
+      - name: Resolve version & mode
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"; publish=true
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            version="${{ github.event.inputs.tag }}"; publish=true
+          else
+            version="manual-$(git rev-parse --short HEAD)"; publish=false
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "Building ${version} (publish release: ${publish})"
+
       - name: Build release binaries
         run: cargo build --release --locked --bins
 
@@ -38,19 +64,22 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          name="ccal-${tag}-aarch64-apple-darwin"
+          name="ccal-${{ steps.meta.outputs.version }}-aarch64-apple-darwin"
           mkdir -p "dist/${name}"
           cp target/release/ccal target/release/ccal-server target/release/import-bear "dist/${name}/"
           cp README.md "dist/${name}/" 2>/dev/null || true
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           shasum -a 256 "dist/${name}.tar.gz" | tee "dist/${name}.tar.gz.sha256"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "tarball=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
+      # Tag push, or manual run with a tag supplied → public Release.
       - name: Create / update GitHub Release
+        if: steps.meta.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.version }}
           files: |
             ${{ steps.package.outputs.tarball }}
             ${{ steps.package.outputs.checksum }}
@@ -71,5 +100,17 @@ jobs:
             Verify the download:
 
             ```sh
-            shasum -a 256 -c ccal-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz.sha256
+            shasum -a 256 -c ${{ steps.package.outputs.name }}.tar.gz.sha256
             ```
+
+      # Manual run with no tag → just a downloadable build artifact (login
+      # required, expires; good for testing the build without a Release).
+      - name: Upload build artifact
+        if: steps.meta.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
