@@ -1,0 +1,128 @@
+//! Optional TOML config shared by the `ccal` TUI and `ccal-server`.
+//!
+//! Precedence everywhere is: explicit env var > config file > built-in
+//! default. Existing env-only deployments keep working untouched; the file
+//! just replaces the long `CCAL_*` incantations for people who'd rather not
+//! export them.
+//!
+//! Location: `$CCAL_CONFIG` if set, otherwise `<os-config-dir>/ccal/
+//! config.toml` (`~/.config/ccal/config.toml` on Linux,
+//! `~/Library/Application Support/ccal/config.toml` on macOS). A missing
+//! file is **not** an error — it means "env / defaults only".
+//!
+//! ```toml
+//! # Shared secret. Both roles fall back to this when their section omits
+//! # `token`, so the common single-operator case is one line.
+//! token = "a-long-random-string"
+//!
+//! [client]
+//! url = "ws://host:8787/sync/ccal"
+//!
+//! [server]
+//! addr = "0.0.0.0:8787"     # bind all interfaces; pick any port here
+//! # data_dir = "/var/lib/ccal"   # optional; default is the OS data dir
+//! ```
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+/// Built-in listen address when neither env nor file says otherwise.
+/// Loopback by design: opening to the network is an explicit choice.
+pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8787";
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Config {
+    /// Shared bearer token; per-section `token` overrides this.
+    pub token: Option<String>,
+    #[serde(default)]
+    pub client: ClientConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ClientConfig {
+    /// Full sync URL, e.g. `ws://host:8787/sync/ccal`.
+    pub url: Option<String>,
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ServerConfig {
+    /// `host:port` to bind. Use `0.0.0.0:PORT` to listen on all interfaces.
+    pub addr: Option<String>,
+    pub token: Option<String>,
+    /// Directory for `{docid}.automerge` replicas.
+    pub data_dir: Option<String>,
+}
+
+/// Resolved path of the config file (whether or not it exists).
+pub fn path() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("CCAL_CONFIG") {
+        return Ok(PathBuf::from(p));
+    }
+    let dirs = directories::ProjectDirs::from("", "", "ccal")
+        .context("could not determine a config directory")?;
+    Ok(dirs.config_dir().join("config.toml"))
+}
+
+impl Config {
+    /// Load the config file, or an all-`None` default if it doesn't exist.
+    /// A present-but-malformed file is a hard error — silently ignoring it
+    /// would hide the operator's intent (e.g. a typo'd bind address).
+    pub fn load() -> Result<Self> {
+        let path = path()?;
+        match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str(&text)
+                .with_context(|| format!("parsing {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Client sync URL: `$CCAL_SYNC_URL` wins, else `[client] url`.
+    /// Empty strings are treated as unset so a blank env var disables sync.
+    pub fn client_url(&self) -> Option<String> {
+        env_or("CCAL_SYNC_URL", self.client.url.as_deref())
+    }
+
+    /// Client token: `$CCAL_SYNC_TOKEN` > `[client] token` > top-level.
+    pub fn client_token(&self) -> Option<String> {
+        env_or(
+            "CCAL_SYNC_TOKEN",
+            self.client.token.as_deref().or(self.token.as_deref()),
+        )
+    }
+
+    /// Server bind address, always resolved: `$CCAL_SYNC_ADDR` >
+    /// `[server] addr` > [`DEFAULT_SERVER_ADDR`].
+    pub fn server_addr(&self) -> String {
+        env_or("CCAL_SYNC_ADDR", self.server.addr.as_deref())
+            .unwrap_or_else(|| DEFAULT_SERVER_ADDR.to_string())
+    }
+
+    /// Server token: `$CCAL_SYNC_TOKEN` > `[server] token` > top-level.
+    pub fn server_token(&self) -> Option<String> {
+        env_or(
+            "CCAL_SYNC_TOKEN",
+            self.server.token.as_deref().or(self.token.as_deref()),
+        )
+    }
+
+    /// Server data dir: `$CCAL_SYNC_DATA` > `[server] data_dir` > `None`
+    /// (caller falls back to the OS data dir).
+    pub fn server_data_dir(&self) -> Option<PathBuf> {
+        env_or("CCAL_SYNC_DATA", self.server.data_dir.as_deref()).map(PathBuf::from)
+    }
+}
+
+/// Env var if set and non-empty, else the file value if non-empty.
+fn env_or(var: &str, file: Option<&str>) -> Option<String> {
+    match std::env::var(var) {
+        Ok(v) if !v.trim().is_empty() => return Some(v),
+        _ => {}
+    }
+    file.filter(|v| !v.trim().is_empty()).map(str::to_string)
+}

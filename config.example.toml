@@ -1,0 +1,49 @@
+# ccal example config — copy to your config path and uncomment what you need.
+#
+# Where ccal looks for this file (both the `ccal` TUI and `ccal-server`):
+#   1. $CCAL_CONFIG, if set (any path you like)
+#   2. otherwise the OS config dir:
+#        Linux   ~/.config/ccal/config.toml
+#                (or $XDG_CONFIG_HOME/ccal/config.toml if XDG_CONFIG_HOME is set)
+#        macOS   ~/Library/Application Support/ccal/config.toml
+#
+# A missing file is fine — it just means "env vars / defaults only".
+# Precedence for every value: environment variable > this file > built-in
+# default. So existing CCAL_* env deployments keep working unchanged.
+
+# Shared bearer token. Both the client and the server fall back to this
+# when their own section omits `token`, so the common single-operator
+# setup is just this one line plus a client `url`. No default — sync is
+# off until a token (and, for the client, a url) resolves.
+# Env override: CCAL_SYNC_TOKEN
+#token = "a-long-random-string"
+
+
+[client]
+# Full sync URL of your ccal-server. No default — without it the TUI runs
+# standalone (no sync thread), which is the same code path either way.
+# Env override: CCAL_SYNC_URL
+#url = "ws://your-server:8787/sync/ccal"
+
+# Optional: client-specific token, overrides the top-level `token`.
+# Env override: CCAL_SYNC_TOKEN
+#token = "a-long-random-string"
+
+
+[server]
+# Address ccal-server binds. Use 0.0.0.0:PORT to listen on all interfaces;
+# loopback is the default because exposing the port is an explicit choice.
+# (Intended to run behind Tailscale, which provides the encryption/auth.)
+# Default: "127.0.0.1:8787"   ·   Env override: CCAL_SYNC_ADDR
+#addr = "0.0.0.0:8787"
+
+# Optional: server-specific token, overrides the top-level `token`.
+# Env override: CCAL_SYNC_TOKEN
+#token = "a-long-random-string"
+
+# Directory for the {docid}.automerge replica files.
+# Default: the OS data dir for "ccal-server"
+#          (Linux ~/.local/share/ccal-server,
+#           macOS ~/Library/Application Support/ccal-server)
+# Env override: CCAL_SYNC_DATA
+#data_dir = "/var/lib/ccal"

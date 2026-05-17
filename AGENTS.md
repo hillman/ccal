@@ -109,9 +109,32 @@ edtui. tui-textarea was removed.
 
 Global: `Tab` switch view · `q` quit · `j/k`/arrows move.
 Todos: `a` add · `e`/`Enter` edit · `d` delete · `J`/`K` reorder.
-Notes: `Enter`/`→` open or descend · `←`/`h` up · `n` new (in current
-folder) · `d` delete note · `r` reload store from disk (pick up an external
-`import-bear` run).
+Notes: `Enter`/`→` open or descend · `←`/`h` up · `n` new · `R` rename ·
+`m` move note · `d` delete note · `r` reload store from disk (pick up an
+external `import-bear` run).
+
+- **Folders are created implicitly** — there is no "make folder" command
+  (none can exist: folders are derived, an empty one has nothing to derive
+  from). You make a folder by *filing a note into it*, two ways:
+  - `n` (new): the typed name is a **path**. Either separator (`/` or `\`)
+    splits it; the **last** segment is the note title, anything before it is
+    a folder path **relative to the folder you're in**. Blank/whitespace
+    segments are dropped. `meeting` → note at the current level (unchanged);
+    `work/ideas/standup` → note "standup" in `work/ideas`, creating both.
+  - `m` (move): prompt for a slash/back-slash path (prefilled with the
+    note's current path, blank = root); the note relocates there, creating
+    folders as needed.
+- `R` (rename): on a note → retitle; on a folder → recursive prefix rewrite
+  over the **whole subtree** (every note whose path starts with it). The new
+  value must be a single path component (no separator).
+- Both `n` and `m` share `App::parse_path` (binary-private, in `app.rs`):
+  splits on `['/', '\\']`, trims, drops empties.
+- Sync: `set_note_title`/`set_note_folder`/`rename_folder` are plain
+  field/list writes — they ride the existing Automerge sync path with no
+  schema or genesis change (folders are still purely derived). Concurrent
+  *rename of the same folder to different names* on two replicas is
+  last-writer-wins per note (notes may split across both names); bodies
+  never lose data (Text CRDT).
 
 **Note editor is modal (Vim, via edtui).** This is deliberate: app commands
 only fire in the editor's **Normal** mode, so typing in Insert/Visual/Search

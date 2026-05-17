@@ -9,15 +9,18 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Entry, Mode, Tab};
+use crate::app::{App, Entry, Mode, Prompt, Tab};
 
 pub fn draw(f: &mut Frame, app: &App) {
+    // While taking text input, grow the bottom strip to two rows so a dim
+    // help line can sit directly above the field being typed into.
+    let inputting = matches!(app.mode, Mode::Input { .. });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(if inputting { 2 } else { 1 }),
         ])
         .split(f.area());
 
@@ -113,7 +116,7 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
     };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " Notes {crumb}  (n new · r reload · Enter open · d del) "
+            " Notes {crumb}  (n new · R rename · m move · d del · r reload) "
         )))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
@@ -125,17 +128,58 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// One-line hint shown above the input field, tailored to what's being
+/// asked. Kept here (presentation) rather than in `app` so the state
+/// machine stays free of UI copy.
+fn input_hint(prompt: &Prompt) -> &'static str {
+    match prompt {
+        Prompt::AddTodo => "New todo  ·  Enter save  ·  Esc cancel",
+        Prompt::EditTodo(_) => "Edit todo  ·  Enter save  ·  Esc cancel",
+        Prompt::NewNote => {
+            "Note name — type folder/note (or folder\\note) to file it; \
+             the folders are created  ·  Enter  ·  Esc"
+        }
+        Prompt::RenameNote(_) => "New note title  ·  Enter save  ·  Esc cancel",
+        Prompt::MoveNote(_) => {
+            "Move to folder path — a/b  ·  blank = root; missing folders \
+             are created  ·  Enter  ·  Esc"
+        }
+        Prompt::RenameFolder(_) => {
+            "New folder name — one component, renames the whole subtree  ·  \
+             Enter  ·  Esc"
+        }
+    }
+}
+
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = match &app.mode {
-        Mode::Input { buffer, .. } => Line::from(vec![
-            Span::styled("› ", Style::default().fg(Color::Yellow)),
-            Span::raw(buffer.as_str()),
-            Span::styled("▏", Style::default().fg(Color::Yellow)),
-        ]),
-        _ => Line::from(Span::styled(
-            app.status.as_str(),
-            Style::default().fg(Color::DarkGray),
-        )),
-    };
-    f.render_widget(Paragraph::new(line), area);
+    match &app.mode {
+        Mode::Input { buffer, prompt } => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(area);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    input_hint(prompt),
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                rows[0],
+            );
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("› ", Style::default().fg(Color::Yellow)),
+                    Span::raw(buffer.as_str()),
+                    Span::styled("▏", Style::default().fg(Color::Yellow)),
+                ])),
+                rows[1],
+            );
+        }
+        _ => f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                app.status.as_str(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        ),
+    }
 }

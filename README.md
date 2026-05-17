@@ -18,6 +18,37 @@ It's using edtui for the note editor - that uses vim bindings, because I love vi
 ## Sync
 Automerge is the storage format and the sync protocol - it's designed for offline first distributed synchronisation.  There will be a sync peer you can run on your own machine and that can be used to sync clients - they all just point to that.  This is intended to be used behind tailscale, so the server doesn't implement encryption or auth, you just let tailscale do that.
 
+### Config file
+
+Both the `ccal` TUI and `ccal-server` read an optional TOML config file. See [`config.example.toml`](config.example.toml) for every setting with its default in a comment — copy it and uncomment what you need.
+
+ccal looks for the file in this order:
+
+1. `$CCAL_CONFIG`, if set (any path you like)
+2. otherwise the OS config directory:
+   - **Linux:** `~/.config/ccal/config.toml` (or `$XDG_CONFIG_HOME/ccal/config.toml` if `XDG_CONFIG_HOME` is set)
+   - **macOS:** `~/Library/Application Support/ccal/config.toml`
+
+A missing file is fine — it just means env vars / defaults only. Precedence for every value is **environment variable > config file > built-in default**, so existing `CCAL_*` env-based deployments keep working unchanged.
+
+Minimal client setup (point the TUI at your server):
+
+```toml
+token = "a-long-random-string"
+
+[client]
+url = "ws://your-server:8787/sync/ccal"
+```
+
+Server listening on all interfaces on a custom port:
+
+```toml
+token = "a-long-random-string"
+
+[server]
+addr = "0.0.0.0:9000"
+```
+
 
 
 ## AI Stuff

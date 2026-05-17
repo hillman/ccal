@@ -24,6 +24,11 @@ pub enum Prompt {
     AddTodo,
     EditTodo(String),
     NewNote,
+    RenameNote(String),
+    /// Move a note: buffer is a slash-separated folder path ("" = root).
+    MoveNote(String),
+    /// Rename the folder at this full path; buffer edits its last component.
+    RenameFolder(Vec<String>),
 }
 
 pub enum Mode {
@@ -69,13 +74,12 @@ impl App {
     pub fn new() -> Result<Self> {
         let store = Arc::new(Mutex::new(Store::open()?));
 
-        // Standalone unless told otherwise. `CCAL_SYNC_URL` like
-        // `ws://host:8787/sync/ccal`; token from `CCAL_SYNC_TOKEN`.
-        let sync = match (
-            std::env::var("CCAL_SYNC_URL"),
-            std::env::var("CCAL_SYNC_TOKEN"),
-        ) {
-            (Ok(url), Ok(token)) if !url.is_empty() && !token.is_empty() => {
+        // Standalone unless both a URL and a token resolve (env var or
+        // config file, env winning). No URL/token → no sync thread, same
+        // code path otherwise.
+        let cfg = ccal::Config::load()?;
+        let sync = match (cfg.client_url(), cfg.client_token()) {
+            (Some(url), Some(token)) => {
                 Some(sync_client::spawn(store.clone(), url, token))
             }
             _ => None,
@@ -339,6 +343,36 @@ impl App {
                 self.entry_sel = 0;
                 self.entries = self.build_entries();
             }
+            KeyCode::Char('R') => match self.selected().cloned() {
+                Some(Entry::Note { id, title }) => {
+                    self.mode = Mode::Input {
+                        prompt: Prompt::RenameNote(id),
+                        buffer: title,
+                    };
+                    self.status = "Rename note — Enter: save · Esc: cancel".into();
+                }
+                Some(Entry::Dir(name)) => {
+                    let mut path = self.cur.clone();
+                    path.push(name.clone());
+                    self.mode = Mode::Input {
+                        prompt: Prompt::RenameFolder(path),
+                        buffer: name,
+                    };
+                    self.status = "Rename folder (whole subtree) — Enter · Esc".into();
+                }
+                None => {}
+            },
+            KeyCode::Char('m') => {
+                if let Some(Entry::Note { id, .. }) = self.selected().cloned() {
+                    self.mode = Mode::Input {
+                        prompt: Prompt::MoveNote(id),
+                        buffer: self.cur.join("/"),
+                    };
+                    self.status = "Move to folder (a/b, blank = root) — Enter · Esc".into();
+                } else {
+                    self.status = "Select a note to move".into();
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(Entry::Note { id, title }) = self.selected().cloned() {
                     self.st().delete_note(&id)?;
@@ -391,21 +425,72 @@ impl App {
                         self.mode = Mode::Normal;
                         self.status = "Todo updated".into();
                     }
+                    Prompt::RenameNote(id) => {
+                        let id = id.clone();
+                        if !text.is_empty() {
+                            self.st().set_note_title(&id, &text)?;
+                            self.persist();
+                            self.refresh();
+                        }
+                        self.mode = Mode::Normal;
+                        self.status = "Note renamed".into();
+                    }
+                    Prompt::MoveNote(id) => {
+                        let id = id.clone();
+                        let folder = parse_path(&text);
+                        self.st().set_note_folder(&id, &folder)?;
+                        self.persist();
+                        self.refresh();
+                        self.mode = Mode::Normal;
+                        self.status = if folder.is_empty() {
+                            "Moved to root".into()
+                        } else {
+                            format!("Moved to /{}", folder.join("/"))
+                        };
+                    }
+                    Prompt::RenameFolder(path) => {
+                        let path = path.clone();
+                        let name = text;
+                        if name.is_empty() || name.contains('/') {
+                            self.mode = Mode::Normal;
+                            self.status = "Folder name must be one path component".into();
+                        } else {
+                            let n = self.st().rename_folder(&path, &name)?;
+                            self.persist();
+                            self.refresh();
+                            self.mode = Mode::Normal;
+                            self.status = format!("Folder renamed ({n} notes updated)");
+                        }
+                    }
                     Prompt::NewNote => {
-                        if text.is_empty() {
+                        // A `folder/note` (or `folder\note`) name files the
+                        // note: the last segment is the title, anything
+                        // before it is a folder path relative to the folder
+                        // you're in. Typing a fresh path *is* how you make a
+                        // folder.
+                        let mut parts = parse_path(&text);
+                        let title = parts.pop().unwrap_or_default();
+                        if title.is_empty() {
                             self.mode = Mode::Normal;
                             self.status = "Empty name — cancelled".into();
                         } else {
-                            let cur = self.cur.clone();
-                            let id = self.st().create_note(&cur, &text)?;
+                            let mut folder = self.cur.clone();
+                            folder.extend(parts);
+                            let id = self.st().create_note(&folder, &title)?;
                             self.persist();
                             self.entries = self.build_entries();
                             self.editor = make_editor("");
                             // New note: drop straight into Insert so you
                             // can type immediately.
                             self.editor.mode = EditorMode::Insert;
-                            self.mode = Mode::NoteEdit { id, title: text };
-                            self.status = "Editing (INSERT) — Esc then q to save & close".into();
+                            let at = if folder.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" in /{}", folder.join("/"))
+                            };
+                            self.mode = Mode::NoteEdit { id, title };
+                            self.status =
+                                format!("Editing (INSERT){at} — Esc then q to save & close");
                         }
                     }
                 }
@@ -453,6 +538,17 @@ impl App {
         self.edit_events.on_key_event(key, &mut self.editor);
         Ok(())
     }
+}
+
+/// Folder path → components. Either separator (`/` or `\`) splits, blank
+/// segments and surrounding whitespace are dropped, so `""`, `"/"`, and
+/// `" a / b "` behave sanely (`[]`, `[]`, `["a","b"]`).
+fn parse_path(s: &str) -> Vec<String> {
+    s.split(['/', '\\'])
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| c.to_string())
+        .collect()
 }
 
 fn make_editor(content: &str) -> EditorState {

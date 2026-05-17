@@ -312,6 +312,51 @@ impl Store {
         Ok(())
     }
 
+    /// Recursively rename a folder: every note whose path begins with
+    /// `path` has the component at `path.len()-1` replaced with `new_name`,
+    /// so the whole subtree moves with it. Returns the number of notes
+    /// updated. One transaction, and bodies are untouched, so a concurrent
+    /// body edit on another replica still merges at character granularity.
+    pub fn rename_folder(&mut self, path: &[String], new_name: &str) -> Result<usize> {
+        if path.is_empty() {
+            return Err(anyhow!("cannot rename the root"));
+        }
+        let depth = path.len() - 1;
+        // Resolve everything under the read borrow first, then mutate.
+        let updates: Vec<(String, Vec<String>)> = self
+            .doc
+            .keys(&self.notes)
+            .filter_map(|id| {
+                let obj = child(&self.doc, &self.notes, &id)?;
+                let folder = get_folder(&self.doc, &obj);
+                if folder.len() > depth && folder[..path.len()] == *path {
+                    let mut nf = folder;
+                    nf[depth] = new_name.to_string();
+                    Some((id, nf))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let ts = now_ms();
+        let mut tx = self.doc.transaction();
+        for (id, nf) in &updates {
+            let Some((Value::Object(_), obj)) = tx.get(&self.notes, id.as_str())? else {
+                continue;
+            };
+            let list = tx.put_object(&obj, "folder", ObjType::List)?;
+            for (i, c) in nf.iter().enumerate() {
+                tx.insert(&list, i, c.as_str())?;
+            }
+            tx.put(&obj, "modified", ts)?;
+        }
+        tx.commit();
+        Ok(updates.len())
+    }
+
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
         let mut tx = self.doc.transaction();
         tx.delete(&self.notes, id)?;
@@ -494,6 +539,29 @@ mod tests {
         assert_eq!(a.note(&id).map(|n| n.body), Some("alpha".to_string()));
         assert!(b.todos().iter().any(|t| t.id == id2 && t.text == "from B"));
         assert!(a.todos().iter().any(|t| t.id == id2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_folder_is_recursive_and_syncs() {
+        let dir = std::env::temp_dir().join(format!("ccal-foldertest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let n1 = a.create_note(&s(&["work"]), "direct").unwrap();
+        let n2 = a.create_note(&s(&["work", "proj"]), "deep").unwrap();
+        let n3 = a.create_note(&s(&["home"]), "untouched").unwrap();
+
+        let hit = a.rename_folder(&s(&["work"]), "job").unwrap();
+        assert_eq!(hit, 2);
+        assert_eq!(a.note(&n1).unwrap().folder, s(&["job"]));
+        assert_eq!(a.note(&n2).unwrap().folder, s(&["job", "proj"]));
+        assert_eq!(a.note(&n3).unwrap().folder, s(&["home"]));
+
+        sync(&mut a, &mut b);
+        assert_eq!(b.note(&n2).map(|n| n.folder), Some(s(&["job", "proj"])));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

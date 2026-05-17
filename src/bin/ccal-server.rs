@@ -19,11 +19,13 @@
 //! stored as plaintext (atomic temp+rename, debounced). That also makes the
 //! server a free backup of the whole corpus.
 //!
-//! Config (env):
-//!   CCAL_SYNC_TOKEN  required — shared bearer token
-//!   CCAL_SYNC_ADDR   listen address           (default 127.0.0.1:8787)
-//!   CCAL_SYNC_DATA   directory for {docid}.automerge replicas
-//!                    (default: OS data dir / ccal-server)
+//! Config — env var or `[server]` in the TOML config file (see
+//! `ccal::config`), env winning, with these resolved values:
+//!   token     required — shared bearer token (CCAL_SYNC_TOKEN / token)
+//!   addr      listen address      (CCAL_SYNC_ADDR / addr, def 127.0.0.1:8787)
+//!   data_dir  {docid}.automerge replica dir (CCAL_SYNC_DATA / data_dir,
+//!             default: OS data dir / ccal-server)
+//! Use `addr = "0.0.0.0:PORT"` to listen on all interfaces.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -67,14 +69,13 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let token = std::env::var("CCAL_SYNC_TOKEN")
-        .context("CCAL_SYNC_TOKEN must be set (shared bearer token)")?;
-    if token.trim().is_empty() {
-        anyhow::bail!("CCAL_SYNC_TOKEN must not be empty");
-    }
-    let addr = std::env::var("CCAL_SYNC_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
-    let data_dir = match std::env::var_os("CCAL_SYNC_DATA") {
-        Some(d) => PathBuf::from(d),
+    let cfg = ccal::Config::load()?;
+    let token = cfg.server_token().context(
+        "no bearer token: set CCAL_SYNC_TOKEN or `token` in the config file",
+    )?;
+    let addr = cfg.server_addr();
+    let data_dir = match cfg.server_data_dir() {
+        Some(d) => d,
         None => directories::ProjectDirs::from("", "", "ccal-server")
             .context("could not determine a data directory")?
             .data_dir()

@@ -25,6 +25,10 @@ uuid = { version = "1", features = ["v4"] }
 directories = "5"
 anyhow = "1"
 
+# Optional TOML config shared by the TUI and the server (see src/config.rs).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
 # TUI binary only. crossterm is used via `ratatui::crossterm` so versions
 # stay aligned with both ratatui and edtui.
 ratatui = "0.30"
