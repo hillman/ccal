@@ -1,5 +1,6 @@
 //! Rendering. Reads `App` state; never touches the store directly.
 
+use edtui::{EditorMode, EditorTheme, EditorView, SyntaxHighlighter};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -23,12 +24,24 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_tabs(f, app, chunks[0]);
     match &app.mode {
         Mode::NoteEdit { title, .. } => {
+            let mode = match app.editor.mode {
+                EditorMode::Normal => "NORMAL",
+                EditorMode::Insert => "INSERT",
+                EditorMode::Visual => "VISUAL",
+                EditorMode::Search => "SEARCH",
+            };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {title} (markdown) "));
-            let mut ta = app.editor.clone();
-            ta.set_block(block);
-            f.render_widget(&ta, chunks[1]);
+                .title(format!(" {title} — {mode}  (md) "));
+            let theme = EditorTheme::default().block(block).hide_status_line();
+            // EditorView needs &mut state; clone for rendering (state of
+            // record lives in App and is mutated via the event handler).
+            let mut ed = app.editor.clone();
+            let view = EditorView::new(&mut ed)
+                .theme(theme)
+                .syntax_highlighter(SyntaxHighlighter::new("dracula", "md").ok())
+                .wrap(true);
+            f.render_widget(view, chunks[1]);
         }
         _ => match app.tab {
             Tab::Todos => draw_todos(f, app, chunks[1]),

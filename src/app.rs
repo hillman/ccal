@@ -3,8 +3,8 @@
 //! `folder` array — there is no folder entity and no filesystem.
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tui_textarea::TextArea;
+use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use ccal::models::{NoteMeta, Todo};
 use ccal::store::Store;
@@ -47,7 +47,9 @@ pub struct App {
     pub cur: Vec<String>,
     pub entries: Vec<Entry>,
     pub entry_sel: usize,
-    pub editor: TextArea<'static>,
+    pub editor: EditorState,
+    /// Persisted across keystrokes — holds multi-key Vim state (e.g. `dd`).
+    edit_events: EditorEventHandler,
 }
 
 impl App {
@@ -64,7 +66,8 @@ impl App {
             cur: Vec::new(),
             entries: Vec::new(),
             entry_sel: 0,
-            editor: TextArea::default(),
+            editor: EditorState::new(Lines::default()),
+            edit_events: EditorEventHandler::default(),
         };
         app.refresh();
         Ok(app)
@@ -259,7 +262,7 @@ impl App {
                     let body = self.store.note(&id).map(|n| n.body).unwrap_or_default();
                     self.editor = make_editor(&body);
                     self.mode = Mode::NoteEdit { id, title };
-                    self.status = "Editing — Esc: save & close".into();
+                    self.status = "Editing (NORMAL) — i insert · q save & close".into();
                 }
             },
             KeyCode::Left | KeyCode::Char('h') if !self.at_root() => {
@@ -329,8 +332,11 @@ impl App {
                             self.persist();
                             self.entries = self.build_entries();
                             self.editor = make_editor("");
+                            // New note: drop straight into Insert so you
+                            // can type immediately.
+                            self.editor.mode = EditorMode::Insert;
                             self.mode = Mode::NoteEdit { id, title: text };
-                            self.status = "Editing — Esc: save & close".into();
+                            self.status = "Editing (INSERT) — Esc then q to save & close".into();
                         }
                     }
                 }
@@ -342,32 +348,44 @@ impl App {
 
     // ---- Note editor ---------------------------------------------------
 
+    fn save_body(&mut self) -> Result<()> {
+        if let Mode::NoteEdit { id, .. } = &self.mode {
+            let id = id.clone();
+            let content = self.editor.lines.to_string();
+            self.store.set_note_body(&id, &content)?;
+            self.persist();
+        }
+        Ok(())
+    }
+
+    /// Modal routing: app commands only fire in the editor's Normal mode;
+    /// Insert/Visual/Search keystrokes go straight to edtui. This is why
+    /// there is no key conflict — typing never triggers app actions.
     fn editor_key(&mut self, key: KeyEvent) -> Result<()> {
-        let save = matches!(key.code, KeyCode::Esc)
-            || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL));
-        if save {
-            if let Mode::NoteEdit { id, .. } = &self.mode {
-                let id = id.clone();
-                let content = self.editor.lines().join("\n");
-                self.store.set_note_body(&id, &content)?;
-                self.persist();
-                self.status = "Saved".into();
-            }
+        // Ctrl+S saves without leaving the editor, in any mode.
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.save_body()?;
+            self.status = "Saved".into();
+            return Ok(());
+        }
+        // In Normal mode, Esc / q save and return to the note list. In
+        // Insert mode Esc belongs to edtui (Insert -> Normal), so it is
+        // deliberately not intercepted here.
+        if self.editor.mode == EditorMode::Normal
+            && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+        {
+            self.save_body()?;
             self.mode = Mode::Normal;
             self.entries = self.build_entries();
             self.clamp();
+            self.status = "Saved · back to list".into();
             return Ok(());
         }
-        self.editor.input(key);
+        self.edit_events.on_key_event(key, &mut self.editor);
         Ok(())
     }
 }
 
-fn make_editor(content: &str) -> TextArea<'static> {
-    let lines: Vec<String> = if content.is_empty() {
-        vec![String::new()]
-    } else {
-        content.lines().map(|l| l.to_string()).collect()
-    };
-    TextArea::new(lines)
+fn make_editor(content: &str) -> EditorState {
+    EditorState::new(Lines::from(content))
 }

@@ -86,13 +86,30 @@ nested tags (`a/b`) → nested folders; untagged → `Untagged`. It is additive
 Toolchain: needs **rustc ≥ 1.89** (Automerge 0.7). Dev machine is on
 Homebrew rust 1.95.
 
+UI stack: **ratatui 0.30** + **edtui 0.11** (Vim editor, syntect markdown
+highlighting). crossterm is **not a direct dependency** — always import it
+via `ratatui::crossterm` so its version stays aligned with both ratatui and
+edtui. tui-textarea was removed.
+
 ## TUI keys
 
 Global: `Tab` switch view · `q` quit · `j/k`/arrows move.
 Todos: `a` add · `e`/`Enter` edit · `d` delete · `J`/`K` reorder.
 Notes: `Enter`/`→` open or descend · `←`/`h` up · `n` new (in current
 folder) · `d` delete note · `r` reload store from disk (pick up an external
-`import-bear` run). In the editor: `Esc` or `Ctrl+S` saves & closes.
+`import-bear` run).
+
+**Note editor is modal (Vim, via edtui).** This is deliberate: app commands
+only fire in the editor's **Normal** mode, so typing in Insert/Visual/Search
+never triggers an app action — there is no key-conflict layer to maintain.
+- Open existing note → starts in **Normal**; `i` to insert.
+- New note → starts in **Insert** (type immediately).
+- `Esc` in Insert → edtui Normal (NOT intercepted by the app).
+- In **Normal**: `q` or `Esc` → save & return to list.
+- `Ctrl+S` (any mode) → save, stay in editor.
+Routing lives in `App::editor_key`; `App::edit_events`
+(`EditorEventHandler`) is persisted across keystrokes because it holds
+multi-key Vim state (`dd`, counts, …). Do not recreate it per event.
 
 ## Direction (not yet built)
 

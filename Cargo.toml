@@ -21,10 +21,10 @@ uuid = { version = "1", features = ["v4"] }
 directories = "5"
 anyhow = "1"
 
-# TUI binary only
-ratatui = "0.29"
-crossterm = "0.28"
-tui-textarea = "0.7"
+# TUI binary only. crossterm is used via `ratatui::crossterm` so versions
+# stay aligned with both ratatui and edtui.
+ratatui = "0.30"
+edtui = "0.11"
 
 # import-bear binary only
 serde_json = "1"
