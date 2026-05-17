@@ -254,6 +254,24 @@ impl Store {
     /// expensive `Text` path, done only when title/folder miss — fine for
     /// an explicit search, like opening a note. Empty query → no results.
     pub fn search_notes(&self, query: &str, include_private_bodies: bool) -> Vec<NoteMeta> {
+        self.search_notes_snippets(query, include_private_bodies)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect()
+    }
+
+    /// As [`Store::search_notes`], but each hit is paired with an optional
+    /// snippet: a one-line window of body text around the first match, so a
+    /// caller can triage results without a follow-up `get_note` per hit. The
+    /// snippet is `None` when the match was on title/folder only (the title
+    /// is already returned) or when the body wasn't searched — in
+    /// particular a **private** note never yields a body snippet, preserving
+    /// the same boundary `search_notes` enforces.
+    pub fn search_notes_snippets(
+        &self,
+        query: &str,
+        include_private_bodies: bool,
+    ) -> Vec<(NoteMeta, Option<String>)> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
             return Vec::new();
@@ -267,20 +285,36 @@ impl Store {
                 let private = get_bool(&self.doc, &obj, "private");
                 let meta_hit = title.to_lowercase().contains(&q)
                     || folder.join("/").to_lowercase().contains(&q);
-                let hit = meta_hit
-                    || ((!private || include_private_bodies)
-                        && child(&self.doc, &obj, "body")
+                // Materialize the body only when title/folder miss and the
+                // body is searchable (never for a private note at the MCP
+                // boundary) — same cost profile as before.
+                let body = (!meta_hit && (!private || include_private_bodies))
+                    .then(|| {
+                        child(&self.doc, &obj, "body")
                             .and_then(|b| self.doc.text(&b).ok())
-                            .map(|t| t.to_lowercase().contains(&q))
-                            .unwrap_or(false));
-                hit.then(|| NoteMeta {
-                    id,
-                    title,
-                    folder,
-                    created: get_i64(&self.doc, &obj, "created"),
-                    modified: get_i64(&self.doc, &obj, "modified"),
-                    private,
-                })
+                    })
+                    .flatten();
+                let body_hit = body
+                    .as_deref()
+                    .map(|t| t.to_lowercase().contains(&q))
+                    .unwrap_or(false);
+                if !meta_hit && !body_hit {
+                    return None;
+                }
+                let snippet = body_hit
+                    .then(|| body.as_deref().and_then(|t| make_snippet(t, &q)))
+                    .flatten();
+                Some((
+                    NoteMeta {
+                        id,
+                        title,
+                        folder,
+                        created: get_i64(&self.doc, &obj, "created"),
+                        modified: get_i64(&self.doc, &obj, "modified"),
+                        private,
+                    },
+                    snippet,
+                ))
             })
             .collect()
     }
@@ -1043,6 +1077,34 @@ fn as_f64(v: Option<(Value<'_>, ObjId)>) -> f64 {
     }
 }
 
+/// A one-line search snippet: the first match of `q` (already lowercased)
+/// in `body`, with up to `PAD` chars of context either side, whitespace
+/// collapsed, ellipsed when clipped. `None` if `q` isn't actually in
+/// `body` (callers only ask after a confirmed substring hit). Byte offsets
+/// are snapped to char boundaries so multi-byte UTF-8 never panics.
+fn make_snippet(body: &str, q: &str) -> Option<String> {
+    const PAD: usize = 70;
+    let at = body.to_lowercase().find(q)?;
+    let lo = body[..at.min(body.len())]
+        .char_indices()
+        .rev()
+        .nth(PAD)
+        .map_or(0, |(i, _)| i);
+    let hi_from = (at + q.len()).min(body.len());
+    let hi = body[hi_from..]
+        .char_indices()
+        .nth(PAD)
+        .map_or(body.len(), |(i, _)| hi_from + i);
+    let mut s = body[lo..hi].split_whitespace().collect::<Vec<_>>().join(" ");
+    if lo > 0 {
+        s.insert(0, '…');
+    }
+    if hi < body.len() {
+        s.push('…');
+    }
+    Some(s)
+}
+
 fn as_bool(v: Option<(Value<'_>, ObjId)>) -> bool {
     matches!(v, Some((Value::Scalar(s), _)) if matches!(s.as_ref(), ScalarValue::Boolean(true)))
 }
@@ -1425,6 +1487,25 @@ mod tests {
 
         // Empty query never spams the whole corpus.
         assert!(a.search_notes("   ", false).is_empty());
+
+        // Snippets: a body hit yields a one-line context window; a
+        // title/folder-only hit and a private body hit yield none.
+        let body_hit = a.search_notes_snippets("widget", false);
+        assert_eq!(body_hit.len(), 1);
+        let snip = body_hit[0].1.as_deref().unwrap();
+        assert!(snip.contains("widget roadmap"));
+        assert!(!snip.contains('\n'), "snippet is single-line");
+
+        // Matched on title only → no snippet (the title is already returned).
+        let title_hit = a.search_notes_snippets("meeting", false);
+        assert_eq!(title_hit.len(), 1);
+        assert!(title_hit[0].1.is_none());
+
+        // Private note matched on title → still no body snippet, ever.
+        let priv_hit = a.search_notes_snippets("bank", false);
+        assert_eq!(priv_hit.len(), 1);
+        assert!(priv_hit[0].0.private);
+        assert!(priv_hit[0].1.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -71,8 +71,12 @@ pub struct ListNotesArgs {
     #[serde(default)]
     pub offset: Option<usize>,
     /// Optional projection: which fields to include per note. `id` is
-    /// always returned (it's the handle). Valid: `title`, `folder`,
-    /// `created`, `modified`, `private`. Omit for all fields.
+    /// always returned (it's the handle). Cheap fields: `title`, `folder`,
+    /// `created`, `modified`, `private`. Body-derived fields (materialized
+    /// for the returned page only, so page it): `body` (full markdown),
+    /// `excerpt` (first ~200 chars, one line — ideal for triaging
+    /// empty/junk/image-only notes), `body_len` (char count). Omit for all
+    /// cheap fields (body-free, the default).
     #[serde(default)]
     pub fields: Option<Vec<String>>,
 }
@@ -112,6 +116,13 @@ pub struct SearchNotesArgs {
 pub struct IdArgs {
     /// The note id (the app-owned UUID, as returned by `list_notes`).
     pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IdsArgs {
+    /// The note ids to fetch (as returned by `list_notes`). Unknown ids are
+    /// silently skipped. Order of the result follows this list.
+    pub ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -226,23 +237,79 @@ fn meta_json(m: &NoteMeta) -> Value {
 
 /// `meta_json` restricted to a projection. `id` is always kept; an empty /
 /// absent field set means "all fields" (full `meta_json`).
-fn meta_json_proj(m: &NoteMeta, fields: Option<&[String]>) -> Value {
+/// Body-derived projection fields. Requesting any of these makes
+/// `list_notes` materialize the note body for the *page only* — the
+/// body-free default path is otherwise untouched.
+const BODY_FIELDS: [&str; 3] = ["body", "excerpt", "body_len"];
+
+/// Does this projection ask for anything that needs the note body?
+fn wants_body(fields: Option<&[String]>) -> bool {
+    fields.is_some_and(|fs| fs.iter().any(|f| BODY_FIELDS.contains(&f.as_str())))
+}
+
+/// First ~200 chars of `body`, whitespace collapsed to one line, ellipsed
+/// if clipped — enough to triage (empty? image-only? a real note?) without
+/// fetching the whole thing.
+fn excerpt(body: &str) -> String {
+    const MAX: usize = 200;
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(MAX) {
+        Some((i, _)) => format!("{}…", &flat[..i]),
+        None => flat,
+    }
+}
+
+/// `meta_json` restricted to a projection. `id` is always kept; an empty /
+/// absent field set means "all fields" (full `meta_json`, still body-free).
+/// `note` is the materialized note, supplied only when the projection asks
+/// for a [`BODY_FIELDS`] entry; privacy is honoured here too — a private
+/// note's `body`/`excerpt` are redacted and its `body_len` is null (the
+/// true length is itself withheld).
+fn meta_json_proj(m: &NoteMeta, note: Option<&Note>, fields: Option<&[String]>) -> Value {
     let Some(fields) = fields else {
         return meta_json(m);
     };
     let mut o = serde_json::Map::new();
     o.insert("id".into(), json!(m.id));
     for f in fields {
-        match f.as_str() {
-            "title" => o.insert("title".into(), json!(m.title)),
-            "folder" => o.insert("folder".into(), json!(m.folder)),
-            "created" => o.insert("created".into(), json!(m.created)),
-            "modified" => o.insert("modified".into(), json!(m.modified)),
-            "private" => o.insert("private".into(), json!(m.private)),
-            _ => None,
+        let (k, v): (&str, Value) = match f.as_str() {
+            "title" => ("title", json!(m.title)),
+            "folder" => ("folder", json!(m.folder)),
+            "created" => ("created", json!(m.created)),
+            "modified" => ("modified", json!(m.modified)),
+            "private" => ("private", json!(m.private)),
+            "body" => match note {
+                Some(n) if n.private => ("body", json!(REDACTED)),
+                Some(n) => ("body", json!(n.body)),
+                None => continue,
+            },
+            "excerpt" => match note {
+                Some(n) if n.private => ("excerpt", json!(REDACTED)),
+                Some(n) => ("excerpt", json!(excerpt(&n.body))),
+                None => continue,
+            },
+            "body_len" => match note {
+                // The true length is itself withheld for a private note.
+                Some(n) if n.private => ("body_len", Value::Null),
+                Some(n) => ("body_len", json!(n.body.chars().count())),
+                None => continue,
+            },
+            _ => continue,
         };
+        o.insert(k.into(), v);
     }
     Value::Object(o)
+}
+
+/// A search hit: the note's meta plus an optional one-line context snippet
+/// (`null` for title/folder-only or private matches — see
+/// [`Store::search_notes_snippets`]).
+fn search_hit_json(m: &NoteMeta, snippet: Option<&str>) -> Value {
+    let mut v = meta_json(m);
+    v.as_object_mut()
+        .unwrap()
+        .insert("snippet".into(), json!(snippet));
+    v
 }
 
 fn todo_json(t: &Todo) -> Value {
@@ -313,7 +380,8 @@ impl Ccal {
         &self,
         Parameters(args): Parameters<ListNotesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let metas = self.doc.store.lock().await.note_metas();
+        let st = self.doc.store.lock().await;
+        let metas = st.note_metas();
         let prefix = args.folder.unwrap_or_default();
         let mut hits: Vec<NoteMeta> = metas
             .into_iter()
@@ -332,10 +400,17 @@ impl Ccal {
             None => total,
         };
         let fields = args.fields.as_deref();
+        // Materialize bodies only for the page, and only if the projection
+        // actually asked for a body-derived field.
+        let need_body = wants_body(fields);
         let out: Vec<Value> = hits[offset..end]
             .iter()
-            .map(|m| meta_json_proj(m, fields))
+            .map(|m| {
+                let note = need_body.then(|| st.note(&m.id)).flatten();
+                meta_json_proj(m, note.as_ref(), fields)
+            })
             .collect();
+        drop(st);
         ok(json!({
             "notes": out,
             "total": total,
@@ -391,9 +466,12 @@ impl Ccal {
     }
 
     #[tool(description = "Full-text search across all notes (title, folder \
-        path and body). Returns matching notes without bodies. A private \
-        note only matches on its title/folder — never its redacted body — \
-        so this can't be used to probe hidden contents.")]
+        path and body). Returns matching notes (no full body) each with a \
+        one-line `snippet` of context around the body match — so you can \
+        triage hits without a get_note per result. `snippet` is null when \
+        the match was on title/folder only, or for a private note (which \
+        only ever matches on title/folder — never its redacted body — so \
+        this can't be used to probe hidden contents).")]
     async fn search_notes(
         &self,
         Parameters(args): Parameters<SearchNotesArgs>,
@@ -404,8 +482,11 @@ impl Ccal {
             .store
             .lock()
             .await
-            .search_notes(&args.query, false);
-        let out: Vec<Value> = hits.iter().map(meta_json).collect();
+            .search_notes_snippets(&args.query, false);
+        let out: Vec<Value> = hits
+            .iter()
+            .map(|(m, snip)| search_hit_json(m, snip.as_deref()))
+            .collect();
         ok(json!({ "notes": out }))
     }
 
@@ -420,6 +501,45 @@ impl Ccal {
             Some(n) => ok(note_json(&n)),
             None => Err(not_found("note")),
         }
+    }
+
+    #[tool(description = "Get many notes' full contents in ONE call \
+        (privacy-redacted like get_note; unknown ids skipped; result order \
+        follows the request). Use this instead of N× get_note when \
+        classifying or reviewing a batch — it's the read-side counterpart \
+        of move_notes. Returns `{ notes: [...] }`.")]
+    async fn get_notes(
+        &self,
+        Parameters(args): Parameters<IdsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let st = self.doc.store.lock().await;
+        let out: Vec<Value> = args
+            .ids
+            .iter()
+            .filter_map(|id| st.note(id).map(|n| note_json(&n)))
+            .collect();
+        drop(st);
+        ok(json!({ "notes": out }))
+    }
+
+    #[tool(description = "Mark a note private (write-only, one-way). After \
+        this its body is redacted to assistants and update_note_body is \
+        refused — use it to lock down a note you discover contains secrets. \
+        You CANNOT undo this or read the body afterwards; only the user can \
+        clear `private`, in the TUI. Idempotent; safe on an already-private \
+        note.")]
+    async fn make_note_private(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.mutate(|st| {
+            if st.note(&args.id).is_none() {
+                return Err(anyhow::anyhow!("no such note"));
+            }
+            st.set_note_private(&args.id, true)
+        })
+        .await?;
+        ok(json!({ "ok": true, "private": true }))
     }
 
     #[tool(description = "Create a note in the given folder (folders are \
@@ -620,13 +740,20 @@ impl ServerHandler for Ccal {
                  derived folder tree (a note's `folder` is a path array; \
                  there is no folder entity — an empty folder simply ceases \
                  to exist). Todos are an ordered list. Use list_notes \
-                 (body-free) to browse, search_notes to find notes by \
-                 title/folder/body text, get_note for contents; edits made \
-                 here sync live to any open ccal client.\n\n\
+                 (body-free) to browse — add the `excerpt` projection \
+                 field to triage many notes (empty/junk/image-only) in one \
+                 call without fetching bodies; search_notes to find notes \
+                 (each hit carries a context `snippet`); get_note for one \
+                 note, or get_notes to pull a whole batch in a single call \
+                 (prefer it over N× get_note). Edits made here sync live to \
+                 any open ccal client.\n\n\
                  PRIVATE NOTES: a note with \"private\": true has its body \
                  redacted — you cannot read or edit it (update_note_body is \
-                 refused). You CAN still rename, move and delete it. Never \
-                 try to work around this; treat its contents as unknown.\n\n\
+                 refused). You CAN still rename, move and delete it, and \
+                 call make_note_private to lock down a note you find holds \
+                 secrets (one-way: only the user can un-private it, in the \
+                 TUI). Never try to work around redaction; treat hidden \
+                 contents as unknown.\n\n\
                  CHECKPOINT DISCIPLINE (important — edits are live and \
                  shared): whenever you are about to make a batch of \
                  changes, FIRST call create_checkpoint with a `reason` \
