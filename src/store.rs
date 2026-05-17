@@ -28,7 +28,12 @@ use std::path::{Path, PathBuf};
 /// the life of that connection.
 pub use automerge::sync::State as SyncState;
 
-use crate::models::{new_id, now_ms, Note, NoteInput, NoteMeta, Todo};
+use automerge::ChangeHash;
+use std::str::FromStr;
+
+use crate::models::{
+    new_id, now_ms, Checkpoint, Note, NoteInput, NoteMeta, RestoreReport, Todo,
+};
 
 const SCHEMA: i64 = 1;
 
@@ -37,6 +42,17 @@ pub struct Store {
     path: PathBuf,
     notes: ObjId,
     todos: ObjId,
+    /// `ROOT["checkpoints"]`, resolved only if it already exists. Unlike
+    /// `notes`/`todos` (seeded by the shared genesis so every replica
+    /// agrees on the ObjId), `checkpoints` is **not** in genesis — adding
+    /// it there would change the genesis bytes and desync every existing
+    /// replica. Instead it is created lazily by the FIRST checkpoint write.
+    /// That is safe specifically because there is exactly one writer: the
+    /// single always-on `ccal-server` (the only place the MCP server runs).
+    /// So the genesis-class "two peers each seed their own ROOT map and
+    /// never converge" hazard cannot arise here. If checkpoints ever gain a
+    /// second independent writer, this assumption must be revisited.
+    checkpoints: Option<ObjId>,
 }
 
 fn data_path() -> Result<PathBuf> {
@@ -112,7 +128,16 @@ impl Store {
         let todos = ensure_map(&mut tx, "todos")?;
         tx.commit();
 
-        Ok(Self { doc, path, notes, todos })
+        // Resolve `checkpoints` ONLY if a prior checkpoint already created
+        // it — never create it here. Creating on open would emit a
+        // map-creation change from every replica, reintroducing exactly the
+        // concurrent-seed divergence genesis exists to prevent.
+        let checkpoints = match doc.get(ROOT, "checkpoints") {
+            Ok(Some((Value::Object(_), id))) => Some(id),
+            _ => None,
+        };
+
+        Ok(Self { doc, path, notes, todos, checkpoints })
     }
 
     /// Persist the document atomically (temp file + rename).
@@ -163,6 +188,12 @@ impl Store {
         if let Ok(Some((Value::Object(_), id))) = self.doc.get(ROOT, "todos") {
             self.todos = id;
         }
+        // Same defensive re-resolve for the lazily-created checkpoints map:
+        // once a peer's first-checkpoint change arrives, pick it up so a
+        // later list/restore sees it.
+        if let Ok(Some((Value::Object(_), id))) = self.doc.get(ROOT, "checkpoints") {
+            self.checkpoints = Some(id);
+        }
         Ok(self.doc.get_heads() != heads_before)
     }
 
@@ -193,6 +224,47 @@ impl Store {
                     folder: get_folder(&self.doc, &obj),
                     created: get_i64(&self.doc, &obj, "created"),
                     modified: get_i64(&self.doc, &obj, "modified"),
+                    private: get_bool(&self.doc, &obj, "private"),
+                })
+            })
+            .collect()
+    }
+
+    /// Case-insensitive substring search over title + folder path, plus
+    /// body — except a **private** note's body is only searched when
+    /// `include_private_bodies` is true. The MCP layer passes `false`, so
+    /// the assistant can find/organise a private note by its (already
+    /// visible) title but can never probe its hidden contents by querying
+    /// for a phrase and seeing it match. Body materialization is the
+    /// expensive `Text` path, done only when title/folder miss — fine for
+    /// an explicit search, like opening a note. Empty query → no results.
+    pub fn search_notes(&self, query: &str, include_private_bodies: bool) -> Vec<NoteMeta> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        self.doc
+            .keys(&self.notes)
+            .filter_map(|id| {
+                let obj = child(&self.doc, &self.notes, &id)?;
+                let title = get_str(&self.doc, &obj, "title");
+                let folder = get_folder(&self.doc, &obj);
+                let private = get_bool(&self.doc, &obj, "private");
+                let meta_hit = title.to_lowercase().contains(&q)
+                    || folder.join("/").to_lowercase().contains(&q);
+                let hit = meta_hit
+                    || ((!private || include_private_bodies)
+                        && child(&self.doc, &obj, "body")
+                            .and_then(|b| self.doc.text(&b).ok())
+                            .map(|t| t.to_lowercase().contains(&q))
+                            .unwrap_or(false));
+                hit.then(|| NoteMeta {
+                    id,
+                    title,
+                    folder,
+                    created: get_i64(&self.doc, &obj, "created"),
+                    modified: get_i64(&self.doc, &obj, "modified"),
+                    private,
                 })
             })
             .collect()
@@ -209,6 +281,7 @@ impl Store {
                 .unwrap_or_default(),
             created: get_i64(&self.doc, &obj, "created"),
             modified: get_i64(&self.doc, &obj, "modified"),
+            private: get_bool(&self.doc, &obj, "private"),
         })
     }
 
@@ -267,6 +340,19 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a note private (or not). Privacy is enforced only at the MCP
+    /// boundary; this is a plain field write that rides sync like
+    /// title/folder. **Not retroactive:** it protects the note from now on,
+    /// not snapshots/history that predate it.
+    pub fn set_note_private(&mut self, id: &str, private: bool) -> Result<()> {
+        let obj = child(&self.doc, &self.notes, id).ok_or_else(|| anyhow!("no such note"))?;
+        let mut tx = self.doc.transaction();
+        tx.put(&obj, "private", private)?;
+        tx.put(&obj, "modified", now_ms())?;
+        tx.commit();
+        Ok(())
+    }
+
     pub fn set_note_folder(&mut self, id: &str, folder: &[String]) -> Result<()> {
         let obj = child(&self.doc, &self.notes, id).ok_or_else(|| anyhow!("no such note"))?;
         let mut tx = self.doc.transaction();
@@ -286,25 +372,10 @@ impl Store {
         let body = child(&self.doc, &obj, "body")
             .ok_or_else(|| anyhow!("note has no body object"))?;
 
-        let old: Vec<char> = self.doc.text(&body)?.chars().collect();
-        let newc: Vec<char> = new.chars().collect();
-
-        let mut p = 0;
-        while p < old.len() && p < newc.len() && old[p] == newc[p] {
-            p += 1;
-        }
-        let mut s = 0;
-        while s < old.len() - p
-            && s < newc.len() - p
-            && old[old.len() - 1 - s] == newc[newc.len() - 1 - s]
-        {
-            s += 1;
-        }
-        let del = old.len() - p - s;
-        let ins: String = newc[p..newc.len() - s].iter().collect();
-        if del == 0 && ins.is_empty() {
+        let cur = self.doc.text(&body)?;
+        let Some((p, del, ins)) = text_splice(&cur, new) else {
             return Ok(());
-        }
+        };
         let mut tx = self.doc.transaction();
         tx.splice_text(&body, p, del as isize, &ins)?;
         tx.put(&obj, "modified", now_ms())?;
@@ -428,6 +499,263 @@ impl Store {
         tx.commit();
         Ok(())
     }
+
+    // ---- Checkpoints ---------------------------------------------------
+    //
+    // A checkpoint copies nothing: Automerge already keeps the entire op
+    // history, so it is just a label + the document heads at creation. A
+    // CRDT cannot rewind, so `restore` does not delete history — it writes
+    // a FORWARD change that reconciles the live corpus back to the
+    // checkpoint's state. That change then syncs and persists through the
+    // exact same path as any edit (one transaction → heads advance →
+    // server rebroadcast + debounced save), so the sync layer needs no
+    // special case at all.
+
+    /// Resolve (or, on first ever use, create) `ROOT["checkpoints"]`. See
+    /// the field comment: lazy single-writer creation is what keeps this
+    /// off the genesis hazard.
+    fn ensure_checkpoints(&mut self) -> Result<ObjId> {
+        if let Some(id) = &self.checkpoints {
+            return Ok(id.clone());
+        }
+        if let Ok(Some((Value::Object(_), id))) = self.doc.get(ROOT, "checkpoints") {
+            self.checkpoints = Some(id.clone());
+            return Ok(id);
+        }
+        let mut tx = self.doc.transaction();
+        let id = tx.put_object(ROOT, "checkpoints", ObjType::Map)?;
+        tx.commit();
+        self.checkpoints = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Record a restore point for the *current* state. `reason` is the
+    /// LLM's (or user's) description of what the surrounding batch is.
+    pub fn create_checkpoint(&mut self, reason: &str) -> Result<String> {
+        // Heads of the state we are remembering — captured before the
+        // bookkeeping write so the checkpoint names the data as it is now.
+        let heads = self.doc.get_heads();
+        let cp = self.ensure_checkpoints()?;
+        let id = new_id();
+        let ts = now_ms();
+        let mut tx = self.doc.transaction();
+        let obj = tx.put_object(&cp, id.as_str(), ObjType::Map)?;
+        tx.put(&obj, "reason", reason)?;
+        tx.put(&obj, "created", ts)?;
+        let hl = tx.put_object(&obj, "heads", ObjType::List)?;
+        for (i, h) in heads.iter().enumerate() {
+            tx.insert(&hl, i, h.to_string().as_str())?;
+        }
+        tx.commit();
+        Ok(id)
+    }
+
+    /// All checkpoints, newest first.
+    pub fn checkpoints(&self) -> Vec<Checkpoint> {
+        let Some(cp) = &self.checkpoints else {
+            return Vec::new();
+        };
+        let mut v: Vec<Checkpoint> = self
+            .doc
+            .keys(cp)
+            .filter_map(|id| {
+                let obj = child(&self.doc, cp, &id)?;
+                Some(Checkpoint {
+                    id,
+                    reason: get_str(&self.doc, &obj, "reason"),
+                    created: get_i64(&self.doc, &obj, "created"),
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
+        v
+    }
+
+    fn checkpoint_heads(&self, id: &str) -> Result<Vec<ChangeHash>> {
+        let cp = self
+            .checkpoints
+            .as_ref()
+            .ok_or_else(|| anyhow!("no checkpoints exist yet"))?;
+        let obj = child(&self.doc, cp, id).ok_or_else(|| anyhow!("no such checkpoint"))?;
+        let hl = child(&self.doc, &obj, "heads")
+            .ok_or_else(|| anyhow!("checkpoint has no heads"))?;
+        let mut hs = Vec::new();
+        for i in 0..self.doc.length(&hl) {
+            if let Ok(Some((Value::Scalar(s), _))) = self.doc.get(&hl, i) {
+                if let ScalarValue::Str(st) = s.as_ref() {
+                    hs.push(
+                        ChangeHash::from_str(st)
+                            .map_err(|e| anyhow!("corrupt checkpoint head: {e}"))?,
+                    );
+                }
+            }
+        }
+        Ok(hs)
+    }
+
+    /// Diff the checkpoint's state against the live corpus. Shared by
+    /// `preview_restore` (report only) and `restore_checkpoint` (applies).
+    fn plan_restore(&self, id: &str) -> Result<RestorePlan> {
+        let heads = self.checkpoint_heads(id)?;
+        // `fork_at` materializes the document exactly as it was at those
+        // heads (history is never pruned, so the hashes are always
+        // reachable once synced). Read-only — we never mutate the fork.
+        let snap = self
+            .doc
+            .fork_at(&heads)
+            .context("forking document at checkpoint heads")?;
+        let target_notes = obj_at(&snap, "notes")
+            .map(|o| all_notes(&snap, &o))
+            .unwrap_or_default();
+        let target_todos = obj_at(&snap, "todos")
+            .map(|o| all_todos(&snap, &o))
+            .unwrap_or_default();
+        let live_notes = all_notes(&self.doc, &self.notes);
+        let live_todos = all_todos(&self.doc, &self.todos);
+
+        use std::collections::{BTreeMap, BTreeSet};
+        let live_n: BTreeMap<&str, &Note> =
+            live_notes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let tgt_n_ids: BTreeSet<&str> =
+            target_notes.iter().map(|n| n.id.as_str()).collect();
+        let live_t: BTreeMap<&str, &Todo> =
+            live_todos.iter().map(|t| (t.id.as_str(), t)).collect();
+        let tgt_t_ids: BTreeSet<&str> =
+            target_todos.iter().map(|t| t.id.as_str()).collect();
+
+        let mut rep = RestoreReport::default();
+        let mut notes_set = Vec::new();
+        for t in &target_notes {
+            match live_n.get(t.id.as_str()) {
+                None => {
+                    rep.notes_added += 1;
+                    notes_set.push(t.clone());
+                }
+                Some(l) => {
+                    if l.title != t.title
+                        || l.folder != t.folder
+                        || l.body != t.body
+                        || l.created != t.created
+                        || l.private != t.private
+                    {
+                        rep.notes_updated += 1;
+                        notes_set.push(t.clone());
+                    }
+                }
+            }
+        }
+        let notes_del: Vec<String> = live_notes
+            .iter()
+            .filter(|l| !tgt_n_ids.contains(l.id.as_str()))
+            .map(|l| l.id.clone())
+            .collect();
+        rep.notes_deleted = notes_del.len();
+
+        let mut todos_set = Vec::new();
+        for t in &target_todos {
+            match live_t.get(t.id.as_str()) {
+                None => {
+                    rep.todos_added += 1;
+                    todos_set.push(t.clone());
+                }
+                Some(l) => {
+                    if l.text != t.text || l.order != t.order || l.created != t.created
+                    {
+                        rep.todos_updated += 1;
+                        todos_set.push(t.clone());
+                    }
+                }
+            }
+        }
+        let todos_del: Vec<String> = live_todos
+            .iter()
+            .filter(|l| !tgt_t_ids.contains(l.id.as_str()))
+            .map(|l| l.id.clone())
+            .collect();
+        rep.todos_deleted = todos_del.len();
+
+        Ok(RestorePlan {
+            notes_set,
+            notes_del,
+            todos_set,
+            todos_del,
+            report: rep,
+        })
+    }
+
+    /// What `restore_checkpoint(id)` would change, without changing it.
+    pub fn preview_restore(&self, id: &str) -> Result<RestoreReport> {
+        Ok(self.plan_restore(id)?.report)
+    }
+
+    /// Reconcile the whole corpus back to `id`'s state in one transaction.
+    /// Whole-corpus by design: this also reverts edits made *after* the
+    /// checkpoint (incl. on other devices) — acceptable under the
+    /// single-operator model, and the returned report shows the extent.
+    pub fn restore_checkpoint(&mut self, id: &str) -> Result<RestoreReport> {
+        let plan = self.plan_restore(id)?;
+        let ts = now_ms();
+        let mut tx = self.doc.transaction();
+
+        for did in &plan.notes_del {
+            tx.delete(&self.notes, did.as_str())?;
+        }
+        for n in &plan.notes_set {
+            let obj = match tx.get(&self.notes, n.id.as_str())? {
+                Some((Value::Object(_), o)) => o,
+                _ => tx.put_object(&self.notes, n.id.as_str(), ObjType::Map)?,
+            };
+            tx.put(&obj, "title", n.title.as_str())?;
+            tx.put(&obj, "created", n.created)?;
+            tx.put(&obj, "modified", ts)?;
+            // `private` is part of the note's state at the checkpoint, so
+            // it reconciles like any field. Privacy is non-retroactive by
+            // design: restoring to a pre-private snapshot legitimately
+            // returns that older (then-unprotected) state.
+            tx.put(&obj, "private", n.private)?;
+            let fl = tx.put_object(&obj, "folder", ObjType::List)?;
+            for (i, c) in n.folder.iter().enumerate() {
+                tx.insert(&fl, i, c.as_str())?;
+            }
+            // Splice only the changed region so a concurrent character
+            // edit still merges, exactly like `set_note_body`.
+            let body = match tx.get(&obj, "body")? {
+                Some((Value::Object(_), b)) => b,
+                _ => tx.put_object(&obj, "body", ObjType::Text)?,
+            };
+            let cur = tx.text(&body)?;
+            if let Some((p, del, ins)) = text_splice(&cur, &n.body) {
+                tx.splice_text(&body, p, del as isize, &ins)?;
+            }
+        }
+
+        for did in &plan.todos_del {
+            tx.delete(&self.todos, did.as_str())?;
+        }
+        for t in &plan.todos_set {
+            let obj = match tx.get(&self.todos, t.id.as_str())? {
+                Some((Value::Object(_), o)) => o,
+                _ => tx.put_object(&self.todos, t.id.as_str(), ObjType::Map)?,
+            };
+            tx.put(&obj, "text", t.text.as_str())?;
+            tx.put(&obj, "order", t.order)?;
+            tx.put(&obj, "created", t.created)?;
+        }
+
+        tx.commit();
+        Ok(plan.report)
+    }
+}
+
+/// Private restore plan: the minimal upserts/deletes to make the corpus
+/// equal the checkpoint. `*_set` are full target entities (recreate if
+/// missing, overwrite the changed fields if present).
+struct RestorePlan {
+    notes_set: Vec<Note>,
+    notes_del: Vec<String>,
+    todos_set: Vec<Todo>,
+    todos_del: Vec<String>,
+    report: RestoreReport,
 }
 
 // ---- Free read helpers (work against any ReadDoc) ----------------------
@@ -458,6 +786,13 @@ fn get_i64<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> i64 {
             _ => 0,
         },
         _ => 0,
+    }
+}
+
+fn get_bool<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> bool {
+    match d.get(obj, key) {
+        Ok(Some((Value::Scalar(s), _))) => matches!(s.as_ref(), ScalarValue::Boolean(true)),
+        _ => false,
     }
 }
 
@@ -492,6 +827,79 @@ fn ensure_map<T: Transactable>(tx: &mut T, key: &str) -> Result<ObjId> {
         return Ok(id);
     }
     Ok(tx.put_object(ROOT, key, ObjType::Map)?)
+}
+
+/// Resolve a `ROOT`-level container in any document (used to read a
+/// `fork_at` snapshot, which has its own ObjIds but the same key layout).
+fn obj_at<D: ReadDoc>(d: &D, key: &str) -> Option<ObjId> {
+    match d.get(ROOT, key) {
+        Ok(Some((Value::Object(_), id))) => Some(id),
+        _ => None,
+    }
+}
+
+/// Materialize one note (body included) from an arbitrary doc — mirrors
+/// `Store::read_note` but free, so it also works on a `fork_at` snapshot.
+fn note_from<D: ReadDoc>(d: &D, notes: &ObjId, id: &str) -> Option<Note> {
+    let obj = child(d, notes, id)?;
+    Some(Note {
+        id: id.to_string(),
+        title: get_str(d, &obj, "title"),
+        folder: get_folder(d, &obj),
+        body: child(d, &obj, "body")
+            .and_then(|b| d.text(&b).ok())
+            .unwrap_or_default(),
+        created: get_i64(d, &obj, "created"),
+        modified: get_i64(d, &obj, "modified"),
+        private: get_bool(d, &obj, "private"),
+    })
+}
+
+fn all_notes<D: ReadDoc>(d: &D, notes: &ObjId) -> Vec<Note> {
+    d.keys(notes)
+        .filter_map(|id| note_from(d, notes, &id))
+        .collect()
+}
+
+fn all_todos<D: ReadDoc>(d: &D, todos: &ObjId) -> Vec<Todo> {
+    d.keys(todos)
+        .filter_map(|id| {
+            let o = child(d, todos, &id)?;
+            Some(Todo {
+                id: id.clone(),
+                text: get_str(d, &o, "text"),
+                order: get_f64(d, &o, "order"),
+                created: get_i64(d, &o, "created"),
+            })
+        })
+        .collect()
+}
+
+/// Minimal `(pos, delete_count, insert)` to turn `old` into `new`, or
+/// `None` if identical. Char-indexed to line up with Automerge's `Text`
+/// splice; shared by `set_note_body` and checkpoint restore so both keep
+/// concurrent character-level merges.
+fn text_splice(old: &str, new: &str) -> Option<(usize, usize, String)> {
+    let old: Vec<char> = old.chars().collect();
+    let newc: Vec<char> = new.chars().collect();
+    let mut p = 0;
+    while p < old.len() && p < newc.len() && old[p] == newc[p] {
+        p += 1;
+    }
+    let mut s = 0;
+    while s < old.len() - p
+        && s < newc.len() - p
+        && old[old.len() - 1 - s] == newc[newc.len() - 1 - s]
+    {
+        s += 1;
+    }
+    let del = old.len() - p - s;
+    let ins: String = newc[p..newc.len() - s].iter().collect();
+    if del == 0 && ins.is_empty() {
+        None
+    } else {
+        Some((p, del, ins))
+    }
 }
 
 #[cfg(test)]
@@ -562,6 +970,150 @@ mod tests {
 
         sync(&mut a, &mut b);
         assert_eq!(b.note(&n2).map(|n| n.folder), Some(s(&["job", "proj"])));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_restores_whole_corpus_and_syncs() {
+        let dir = std::env::temp_dir().join(format!("ccal-cptest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Baseline corpus, then a checkpoint of exactly this state.
+        let keep = a.create_note(&s(&["work"]), "keep").unwrap();
+        a.set_note_body(&keep, "original body").unwrap();
+        let doomed = a.create_note(&s(&["work"]), "doomed").unwrap();
+        let t_keep = a.add_todo("buy milk").unwrap();
+        let cp = a.create_checkpoint("before LLM reorg").unwrap();
+
+        // A messy batch: edit, delete, create, churn todos.
+        a.set_note_body(&keep, "WRECKED by the assistant").unwrap();
+        a.set_note_title(&keep, "mangled").unwrap();
+        a.delete_note(&doomed).unwrap();
+        let added = a.create_note(&s(&["junk"]), "spurious").unwrap();
+        a.set_todo_text(&t_keep, "buy oat milk instead").unwrap();
+        let t_extra = a.add_todo("delete production db").unwrap();
+
+        // Preview reports the blast radius without changing anything.
+        let prev = a.preview_restore(&cp).unwrap();
+        assert_eq!(prev.notes_updated, 1, "keep note differs");
+        assert_eq!(prev.notes_added, 1, "doomed must be recreated");
+        assert_eq!(prev.notes_deleted, 1, "spurious must be removed");
+        assert_eq!(a.note(&keep).unwrap().title, "mangled", "preview is read-only");
+
+        // Restore: the whole corpus snaps back to the checkpoint.
+        let rep = a.restore_checkpoint(&cp).unwrap();
+        assert_eq!((rep.notes_added, rep.notes_deleted, rep.notes_updated), (1, 1, 1));
+
+        let n = a.note(&keep).unwrap();
+        assert_eq!(n.title, "keep");
+        assert_eq!(n.body, "original body");
+        assert!(a.note(&doomed).is_some(), "deleted note came back");
+        assert!(a.note(&added).is_none(), "post-checkpoint note removed");
+        assert_eq!(a.todos().len(), 1);
+        assert_eq!(a.todos()[0].text, "buy milk");
+        assert!(a.todos().iter().all(|t| t.id != t_extra));
+
+        // The restore is an ordinary forward change: it (and the
+        // checkpoint metadata, lazily created) sync to a fresh peer, which
+        // converges to the restored state — no special-casing needed.
+        sync(&mut a, &mut b);
+        assert_eq!(b.note(&keep).map(|n| n.body), Some("original body".to_string()));
+        assert!(b.note(&doomed).is_some());
+        assert!(b.note(&added).is_none());
+        assert_eq!(b.todos().len(), 1);
+        assert!(b.checkpoints().iter().any(|c| c.id == cp && c.reason == "before LLM reorg"));
+
+        // History is intact, so the same checkpoint restores again
+        // (idempotent) even after more churn.
+        a.delete_note(&keep).unwrap();
+        a.restore_checkpoint(&cp).unwrap();
+        assert_eq!(a.note(&keep).map(|n| n.body), Some("original body".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_flag_syncs_and_is_non_retroactive_on_restore() {
+        let dir = std::env::temp_dir().join(format!("ccal-privtest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let id = a.create_note(&s(&["secrets"]), "creds").unwrap();
+        a.set_note_body(&id, "public draft").unwrap();
+        assert!(!a.note(&id).unwrap().private, "notes default to not-private");
+
+        // Checkpoint taken while the note is still public.
+        let cp_public = a.create_checkpoint("before secrets").unwrap();
+
+        // User adds a secret, THEN marks it private.
+        a.set_note_body(&id, "public draft\npassword: hunter2").unwrap();
+        a.set_note_private(&id, true).unwrap();
+        assert!(a.note(&id).unwrap().private);
+
+        // The flag is plain synced state.
+        sync(&mut a, &mut b);
+        assert!(b.note(&id).unwrap().private, "private flag converges");
+
+        // Non-retroactive by design (user's decision): restoring to the
+        // pre-private checkpoint returns that older state verbatim —
+        // private goes back to false and the then-current body comes back.
+        // Restore is NOT skipped for private notes.
+        let rep = a.restore_checkpoint(&cp_public).unwrap();
+        assert_eq!(rep.notes_updated, 1);
+        let n = a.note(&id).unwrap();
+        assert!(!n.private, "restore reconciles `private` like any field");
+        assert_eq!(n.body, "public draft", "older snapshot body restored");
+
+        // And a checkpoint taken WHILE private restores private=true.
+        a.set_note_body(&id, "secret again").unwrap();
+        a.set_note_private(&id, true).unwrap();
+        let cp_priv = a.create_checkpoint("while private").unwrap();
+        a.set_note_private(&id, false).unwrap();
+        a.restore_checkpoint(&cp_priv).unwrap();
+        assert!(a.note(&id).unwrap().private, "private state is restorable too");
+
+        sync(&mut a, &mut b);
+        assert!(b.note(&id).unwrap().private);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_respects_privacy_boundary() {
+        let dir = std::env::temp_dir().join(format!("ccal-searchtest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let pub_id = a.create_note(&s(&["work"]), "meeting notes").unwrap();
+        a.set_note_body(&pub_id, "discussed the widget roadmap").unwrap();
+        let sec_id = a.create_note(&s(&["vault"]), "bank login").unwrap();
+        a.set_note_body(&sec_id, "the magicword is swordfish").unwrap();
+        a.set_note_private(&sec_id, true).unwrap();
+
+        // Body term in a public note: found.
+        let h = a.search_notes("widget", false);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].id, pub_id);
+
+        // Body term in a PRIVATE note: not found at the MCP setting…
+        assert!(a.search_notes("swordfish", false).is_empty());
+        // …but the user-side path (TUI) can still find it.
+        assert_eq!(a.search_notes("swordfish", true).len(), 1);
+
+        // Title/folder of a private note stay searchable either way (that
+        // metadata is already visible to the assistant via list_notes).
+        let by_title = a.search_notes("bank", false);
+        assert_eq!(by_title.len(), 1);
+        assert_eq!(by_title[0].id, sec_id);
+        assert!(by_title[0].private);
+        assert_eq!(a.search_notes("vault", false).len(), 1);
+
+        // Empty query never spams the whole corpus.
+        assert!(a.search_notes("   ", false).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

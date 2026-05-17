@@ -9,7 +9,7 @@ use anyhow::Result;
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use ccal::models::{now_ms, NoteMeta, Todo};
+use ccal::models::{now_ms, Note, NoteMeta, Todo};
 use ccal::store::Store;
 
 use crate::sync_client;
@@ -35,12 +35,15 @@ pub enum Mode {
     Normal,
     Input { prompt: Prompt, buffer: String },
     NoteEdit { id: String, title: String },
+    /// Live text search across *all* notes (the folder view collapses to a
+    /// flat list of matches). Esc returns to Normal.
+    Search { query: String },
 }
 
 #[derive(Clone)]
 pub enum Entry {
     Dir(String),
-    Note { id: String, title: String },
+    Note { id: String, title: String, private: bool },
 }
 
 pub struct App {
@@ -68,6 +71,10 @@ pub struct App {
     pub editor: EditorState,
     /// Persisted across keystrokes — holds multi-key Vim state (e.g. `dd`).
     edit_events: EditorEventHandler,
+    /// Materialized once when entering [`Mode::Search`] (and refreshed on a
+    /// live sync change) so per-keystroke filtering never re-reads every
+    /// note body. Empty/ignored outside search.
+    search_index: Vec<Note>,
 }
 
 impl App {
@@ -100,6 +107,7 @@ impl App {
             entry_sel: 0,
             editor: EditorState::new(Lines::default()),
             edit_events: EditorEventHandler::default(),
+            search_index: Vec::new(),
         };
         app.refresh();
         Ok(app)
@@ -175,6 +183,12 @@ impl App {
     fn refresh(&mut self) {
         let todos = self.st().todos();
         self.todos = todos;
+        // Keep the search corpus live: a remote sync edit during a search
+        // should show up in the results too.
+        if matches!(self.mode, Mode::Search { .. }) {
+            let notes = self.st().notes();
+            self.search_index = notes;
+        }
         self.entries = self.build_entries();
         self.clamp();
     }
@@ -195,6 +209,44 @@ impl App {
     }
 
     fn build_entries(&self) -> Vec<Entry> {
+        // Search collapses the folder tree to a flat list of matches across
+        // the whole corpus, filtered live from the in-memory index (no
+        // store lock, no per-keystroke body re-read).
+        if let Mode::Search { query } = &self.mode {
+            let q = query.trim().to_lowercase();
+            if q.is_empty() {
+                return Vec::new();
+            }
+            let mut hits: Vec<&Note> = self
+                .search_index
+                .iter()
+                .filter(|n| {
+                    n.title.to_lowercase().contains(&q)
+                        || n.folder.join("/").to_lowercase().contains(&q)
+                        || n.body.to_lowercase().contains(&q)
+                })
+                .collect();
+            hits.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.title.cmp(&b.title)));
+            return hits
+                .into_iter()
+                .map(|n| {
+                    let where_ = if n.folder.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("/{}", n.folder.join("/"))
+                    };
+                    Entry::Note {
+                        id: n.id.clone(),
+                        title: format!(
+                            "{}  ⟨{where_}⟩",
+                            if n.title.is_empty() { "(untitled)" } else { &n.title }
+                        ),
+                        private: n.private,
+                    }
+                })
+                .collect();
+        }
+
         let notes = self.st().note_metas();
         let depth = self.cur.len();
         let mut dirs: Vec<String> = Vec::new();
@@ -216,6 +268,7 @@ impl App {
         out.extend(here.into_iter().map(|n| Entry::Note {
             id: n.id.clone(),
             title: if n.title.is_empty() { "(untitled)".into() } else { n.title.clone() },
+            private: n.private,
         }));
         out
     }
@@ -223,8 +276,13 @@ impl App {
     fn at_root(&self) -> bool {
         self.cur.is_empty()
     }
+    /// A flat list (no leading ".." row): the root folder, or any search
+    /// result set (matches span folders, so there's nothing to go "up" to).
+    pub fn flat_list(&self) -> bool {
+        self.at_root() || matches!(self.mode, Mode::Search { .. })
+    }
     fn note_rows(&self) -> usize {
-        self.entries.len() + if self.at_root() { 0 } else { 1 }
+        self.entries.len() + if self.flat_list() { 0 } else { 1 }
     }
 
     fn clamp(&mut self) {
@@ -242,6 +300,7 @@ impl App {
             Mode::Normal => self.normal_key(key)?,
             Mode::Input { .. } => self.input_key(key)?,
             Mode::NoteEdit { .. } => self.editor_key(key)?,
+            Mode::Search { .. } => self.search_key(key)?,
         }
         self.clamp();
         Ok(())
@@ -328,7 +387,7 @@ impl App {
 
     /// `None` = the ".." row; otherwise the selected entry.
     fn selected(&self) -> Option<&Entry> {
-        if self.at_root() {
+        if self.flat_list() {
             self.entries.get(self.entry_sel)
         } else if self.entry_sel == 0 {
             None
@@ -355,7 +414,7 @@ impl App {
                     self.entry_sel = 0;
                     self.entries = self.build_entries();
                 }
-                Some(Entry::Note { id, title }) => {
+                Some(Entry::Note { id, title, .. }) => {
                     let body = self.st().note(&id).map(|n| n.body).unwrap_or_default();
                     self.editor = make_editor(&body);
                     self.mode = Mode::NoteEdit { id, title };
@@ -368,7 +427,7 @@ impl App {
                 self.entries = self.build_entries();
             }
             KeyCode::Char('R') => match self.selected().cloned() {
-                Some(Entry::Note { id, title }) => {
+                Some(Entry::Note { id, title, .. }) => {
                     self.mode = Mode::Input {
                         prompt: Prompt::RenameNote(id),
                         buffer: title,
@@ -398,7 +457,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(Entry::Note { id, title }) = self.selected().cloned() {
+                if let Some(Entry::Note { id, title, .. }) = self.selected().cloned() {
                     self.st().delete_note(&id)?;
                     self.persist();
                     self.entries = self.build_entries();
@@ -407,6 +466,83 @@ impl App {
                 } else if matches!(self.selected(), Some(Entry::Dir(_))) {
                     self.status = "Folders are derived — delete the notes inside".into();
                 }
+            }
+            KeyCode::Char('p') => {
+                if let Some(Entry::Note { id, title, private }) = self.selected().cloned() {
+                    self.st().set_note_private(&id, !private)?;
+                    self.persist();
+                    self.entries = self.build_entries();
+                    self.status = if private {
+                        format!("'{title}' is no longer private — visible to assistants")
+                    } else {
+                        // Nudge: privacy starts now; it can't hide content
+                        // that older checkpoints/history already captured.
+                        format!(
+                            "'{title}' is now private (hidden from assistants). \
+                             Tip: mark notes private BEFORE adding secrets — \
+                             earlier snapshots still hold prior content."
+                        )
+                    };
+                } else {
+                    self.status = "Select a note to toggle private".into();
+                }
+            }
+            KeyCode::Char('/') => self.enter_search(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ---- Search --------------------------------------------------------
+
+    fn enter_search(&mut self) {
+        // Materialize the corpus once; per-keystroke filtering is then a
+        // pure in-memory scan (see `build_entries`).
+        let notes = self.st().notes();
+        self.search_index = notes;
+        self.mode = Mode::Search { query: String::new() };
+        self.entry_sel = 0;
+        self.entries = self.build_entries();
+        self.status = "Search all notes — type to filter · ↑↓ select · Enter open · Esc cancel".into();
+    }
+
+    fn exit_search(&mut self) {
+        self.search_index = Vec::new();
+        self.mode = Mode::Normal;
+        self.entry_sel = 0;
+        self.entries = self.build_entries();
+        self.status = "Search cancelled".into();
+    }
+
+    fn search_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => self.exit_search(),
+            KeyCode::Down => self.move_sel(1),
+            KeyCode::Up => self.move_sel(-1),
+            KeyCode::Enter => {
+                if let Some(Entry::Note { id, .. }) = self.selected().cloned() {
+                    let note = self.st().note(&id);
+                    let title = note.as_ref().map(|n| n.title.clone()).unwrap_or_default();
+                    let body = note.map(|n| n.body).unwrap_or_default();
+                    self.search_index = Vec::new();
+                    self.editor = make_editor(&body);
+                    self.mode = Mode::NoteEdit { id, title };
+                    self.status = "Editing (NORMAL) — i insert · q save & close".into();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Mode::Search { query } = &mut self.mode {
+                    query.pop();
+                }
+                self.entry_sel = 0;
+                self.entries = self.build_entries();
+            }
+            KeyCode::Char(c) => {
+                if let Mode::Search { query } = &mut self.mode {
+                    query.push(c);
+                }
+                self.entry_sel = 0;
+                self.entries = self.build_entries();
             }
             _ => {}
         }

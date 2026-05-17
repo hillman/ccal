@@ -56,6 +56,13 @@ pub struct ServerConfig {
     pub token: Option<String>,
     /// Directory for `{docid}.automerge` replicas.
     pub data_dir: Option<String>,
+    /// Opt-in: expose the embedded MCP server at `/mcp` (same listener,
+    /// same bearer token). Off unless explicitly enabled.
+    pub mcp: Option<bool>,
+    /// Which docid the MCP server reads/writes. Defaults to `ccal` — the
+    /// same replica a TUI on `ws://…/sync/ccal` shares, so assistant edits
+    /// propagate live through the existing change-broadcast.
+    pub mcp_doc: Option<String>,
 }
 
 /// Resolved path of the config file (whether or not it exists).
@@ -115,6 +122,27 @@ impl Config {
     /// (caller falls back to the OS data dir).
     pub fn server_data_dir(&self) -> Option<PathBuf> {
         env_or("CCAL_SYNC_DATA", self.server.data_dir.as_deref()).map(PathBuf::from)
+    }
+
+    /// Whether to expose the embedded MCP server: `$CCAL_MCP` (truthy:
+    /// `1`/`true`/`yes`/`on`, case-insensitive) > `[server] mcp` > `false`.
+    /// Off by design — the MCP surface is full read+write over whatever
+    /// guards the listener, so turning it on is an explicit choice.
+    pub fn server_mcp_enabled(&self) -> bool {
+        match std::env::var("CCAL_MCP") {
+            Ok(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => self.server.mcp.unwrap_or(false),
+        }
+    }
+
+    /// Docid the MCP server operates on: `$CCAL_MCP_DOC` >
+    /// `[server] mcp_doc` > `ccal` (the conventional default docid).
+    pub fn server_mcp_doc(&self) -> String {
+        env_or("CCAL_MCP_DOC", self.server.mcp_doc.as_deref())
+            .unwrap_or_else(|| "ccal".to_string())
     }
 }
 

@@ -23,8 +23,10 @@ src/main.rs           `ccal` TUI binary entry (event loop, terminal setup)
 src/app.rs            TUI state machine + key handling   (binary-private)
 src/ui.rs             ratatui rendering                  (binary-private)
 src/sync_client.rs    background sync thread             (binary-private)
+src/server_mcp.rs     optional embedded MCP server  (ccal-server-private,
+                      pulled in via #[path] — never compiled into the lib)
 src/bin/import-bear.rs `import-bear` binary — standalone one-shot importer
-src/bin/ccal-server.rs  `ccal-server` binary — Automerge sync peer
+src/bin/ccal-server.rs  `ccal-server` binary — Automerge sync peer (+ MCP)
 ```
 
 Hard rule: `import-bear`, `ccal-server` and the TUI share **only**
@@ -41,8 +43,10 @@ Persisted as ONE Automerge document: `<data_dir>/ccal.automerge`
 ROOT map:
 - `schema`: Int
 - `notes`: Map  id → `{ title:Str, folder:List<Str>, body:Text,
-  created:Int(ms), modified:Int(ms) }`
+  created:Int(ms), modified:Int(ms), private:Bool? (absent = false) }`
 - `todos`: Map  id → `{ text:Str, order:F64, created:Int(ms) }`
+- `checkpoints`: Map  id → `{ reason:Str, created:Int(ms),
+  heads:List<Str> }` — **lazily created**, NOT in genesis (see below)
 
 - **Genesis.** A fresh replica starts from `genesis_doc()` — the canonical
   empty doc built with a FIXED actor + FIXED commit time, so the genesis
@@ -62,6 +66,48 @@ ROOT map:
   Deleting a folder = deleting the notes in it; there is no folder object.
 - **Todo order**: fractional `order: f64`; reorder swaps two todos' keys
   (`Store::swap_todo_order`); list sorted by `(order, id)`.
+- **Checkpoints** (for the MCP "let the LLM safely reorganise" story).
+  Automerge never prunes history, so a checkpoint copies nothing — it's
+  just `{reason, created, heads}` where `heads` are the hex
+  `get_heads()` at creation. **Restore is a forward change, not a
+  rewind** (a CRDT can't subtract): `restore_checkpoint` does
+  `fork_at(heads)`, diffs that snapshot against the live corpus, and
+  applies the minimal upserts/deletes in ONE transaction (note bodies via
+  the shared `text_splice` so concurrent char edits still merge). It is
+  therefore *whole-corpus* — it also reverts edits made after the
+  checkpoint, even on other devices (fine under the single-operator model;
+  the returned `RestoreReport` shows the blast radius). Because it's just
+  another transaction, it syncs + persists through the existing path with
+  zero special-casing — proven by `checkpoint_restores_whole_corpus_and_syncs`.
+  - **Why `checkpoints` isn't in `genesis_doc()`:** adding a ROOT key to
+    genesis changes the genesis bytes and desyncs every existing replica
+    (same hazard as the pre-genesis Bear doc). Instead the map is created
+    **lazily by the first checkpoint write**, and `open_at` only *resolves*
+    it (never creates). That's safe **only because there is exactly one
+    writer** — the single always-on `ccal-server` (the only place the MCP
+    server runs) — so the "two peers each seed their own ROOT map" genesis
+    hazard can't occur. `receive_sync_message` re-resolves it, same as
+    `notes`/`todos`. A second independent checkpoint writer would break
+    this assumption — revisit if that ever happens.
+- **Private notes** (`private` bool, absent = false). User-only "hide this
+  from the LLM" — set in the TUI (`p`), **never** via MCP (no tool exists,
+  so a model can't un-hide a note to read it). Enforced **only at the MCP
+  boundary**: `note_json` always swaps a private body for a redaction
+  string and `update_note_body` refuses; the TUI and sync keep the real
+  content (this is LLM-scoping, NOT encryption at rest — consistent with
+  the plaintext trust model). The LLM may still rename/move/delete a
+  private note (user's call: delete is recoverable via checkpoints). It is
+  a plain synced field (rides sync like title/folder, no genesis impact).
+  - **Non-retroactive — deliberate (user decision).** `private` reconciles
+    on restore like any field; restoring to a checkpoint where the note
+    was public legitimately returns that older, then-unprotected body with
+    `private=false`. So privacy protects from the moment it's set, NOT
+    snapshots/history that predate it. The TUI toast on toggling private
+    says as much; mark notes private *before* adding secrets. Do not
+    "fix" this by special-casing private notes in restore — it was
+    considered and explicitly rejected (would make restore lossy/uncanny;
+    the accepted limitation is simpler and was the user's choice). Covered
+    by `private_flag_syncs_and_is_non_retroactive_on_restore`.
 
 ## Critical performance constraint
 
@@ -110,8 +156,16 @@ edtui. tui-textarea was removed.
 Global: `Tab` switch view · `q` quit · `j/k`/arrows move.
 Todos: `a` add · `e`/`Enter` edit · `d` delete · `J`/`K` reorder.
 Notes: `Enter`/`→` open or descend · `←`/`h` up · `n` new · `R` rename ·
-`m` move note · `d` delete note · `r` reload store from disk (pick up an
-external `import-bear` run).
+`m` move note · `p` toggle private (hide body from the LLM) · `/` search ·
+`d` delete note · `r` reload store from disk (pick up an external
+`import-bear` run).
+- `/` (Notes view) enters **search mode** (`Mode::Search{query}`): the
+  folder tree collapses to a flat, live-filtered list of matches across
+  the *whole* corpus (title/folder/body, full content — the user owns it).
+  ↑↓ select · Enter opens · Backspace edits · Esc cancels. The corpus is
+  materialized once on `/` into `App::search_index` (and refreshed on a
+  live sync change) so per-keystroke filtering never re-reads bodies.
+  `flat_list()` (root **or** searching) drives the no-".."-row logic.
 
 - **Folders are created implicitly** — there is no "make folder" command
   (none can exist: folders are derived, an empty one has nothing to derive
@@ -183,6 +237,69 @@ either ⇒ standalone, same code path, no thread.
   (tokio-tungstenite ↔ real server), `tests/sync_client_transport.rs`
   (the *blocking* client transport ↔ real server: bearer handshake,
   non-blocking pump, convergence). Each test uses its own port.
+
+## MCP server (optional, embedded in `ccal-server`)
+
+An MCP server for LLM coding assistants to organise/summarise the corpus —
+**opt-in**, off unless `CCAL_MCP` / `[server] mcp` is set. Lives in
+`src/server_mcp.rs`, `ccal-server`-private (pulled in with
+`#[path] mod mcp;`, exactly like the TUI's binary-private modules) so the
+lib stays tokio-free and Automerge stays sealed in `store.rs` — the same
+hard rule as the rest of the codebase.
+
+- **Why embedded, not a standalone stdio peer:** `ccal-server` already
+  holds the shared `Doc { store, changed, dirty }` and rebroadcasts to
+  every connected peer. An MCP tool just does what `serve_peer` does after
+  a received change — mutate `doc.store`, then `dirty.notify_one()` +
+  `changed.send(())`. So an assistant's edits reach every open TUI **live**
+  through the existing, proven sync path with zero new sync code. (A
+  client-side stdio binary was the alternative; rejected — third replica,
+  its own reconnect logic, still needs the server running anyway.)
+- Transport: rmcp (`modelcontextprotocol/rust-sdk`) **streamable-HTTP**, a
+  generic `tower` Service nested at `/mcp` on the *same* axum listener — no
+  axum bump, WS sync path untouched. A daemon can't be stdio.
+- Auth/trust: identical to sync — a `Bearer <token>` middleware (same token
+  as the WS path) in front of `/mcp`; `disable_allowed_hosts()` because the
+  gate is the token + Tailscale/TLS, and the client is a CLI assistant not
+  a browser. Full read+write surface is *why* the whole thing is opt-in.
+- Tools (18): `list_notes` (body-free, optional folder-prefix scope),
+  `search_notes` (title/folder/body, privacy-aware), `get_note`,
+  `create_note`, `set_note_title`, `update_note_body`, `move_note`,
+  `rename_folder`, `delete_note`, `list_todos`, `add_todo`,
+  `set_todo_text`, `swap_todos`, `delete_todo`, plus checkpoints:
+  `create_checkpoint`, `list_checkpoints`, `preview_restore`,
+  `restore_checkpoint` — all through the existing `Store` facade; each
+  mutation (restore included) rides the live-sync notify path above.
+- **Privacy boundary lives here.** `note_json` redacts a private note's
+  body for *every* tool that returns a note (so no path can leak by
+  forgetting); `update_note_body` refuses on a private note (check +
+  mutate under one lock). `list_notes`/`get_note` expose the `private`
+  flag so the model knows. No tool sets privacy — that's TUI-only by
+  design. Restore/preview never expose bodies (only counts).
+  `search_notes` calls `Store::search_notes(q, false)` so a private
+  note can only match its title/folder, never its body — you can't probe
+  hidden contents by querying for a phrase and seeing it match. The
+  `get_info` instructions tell the model: private bodies are unknown,
+  don't try to work around it; rename/move/delete still allowed.
+- The `get_info` instructions impose **checkpoint discipline**: before a
+  batch of edits the LLM must `create_checkpoint` with a reason, again
+  after, and `preview_restore` before any `restore_checkpoint`. This is
+  prompt-only (no enforcement) — the user chose explicit-LLM over an
+  auto-checkpoint-per-session; revisit if models skip it in practice.
+- Config: `CCAL_MCP` (1/true/yes/on) enables it; `CCAL_MCP_DOC` (default
+  `ccal`) is the docid it edits — must match the clients' sync docid (the
+  last path segment of their `url`) or the assistant edits a different
+  replica. Connect: `claude mcp add --transport http ccal
+  http://host:8787/mcp --header "Authorization: Bearer <token>"`.
+- Smoke-tested manually (initialize → tools/list → CRUD → checkpoint /
+  preview / restore round-trip → search → 401 on bad token). Checkpoint/
+  restore *logic* + sync-cleanliness is unit-tested
+  (`checkpoint_restores_whole_corpus_and_syncs`); privacy + non-retroactive
+  restore by `private_flag_syncs_and_is_non_retroactive_on_restore`;
+  search + its privacy boundary by `search_respects_privacy_boundary`
+  (the redacted/blocked paths can't be hit live since marking private is
+  TUI-only); live MCP→peer propagation is the *same* `dirty`/`changed`
+  calls `sync_e2e` already proves converge — not separately automated yet.
 
 **Still open:** wss:// in the client; `Store` reload during live sync forces
 a full peer resync (acceptable for the import-bear case); concurrent remote

@@ -46,6 +46,16 @@ serde_json = "1"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 
+# ccal-server binary only — the optional embedded MCP server. rmcp's
+# streamable-HTTP transport is a generic `tower` Service (http/hyper v1,
+# Error = Infallible) so it nests straight into the existing axum 0.7
+# router; no axum bump, the proven WS sync path is untouched. MCP mutations
+# go through `ccal::Store` and the server's existing change-broadcast, so
+# edits an assistant makes appear live in every connected TUI. Opt-in
+# (CCAL_MCP / `[server] mcp`); absent ⇒ this code never runs.
+rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "macros"] }
+tokio-util = "0.7"
+
 [dev-dependencies]
 # End-to-end test drives the real ccal-server binary over WebSockets.
 tokio-tungstenite = "0.24"

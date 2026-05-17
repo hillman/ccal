@@ -35,14 +35,26 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
 use ccal::{Store, SyncState};
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 use tokio::sync::{broadcast, Mutex, Notify};
+use tokio_util::sync::CancellationToken;
+
+// Binary-private, exactly like the TUI's `app`/`ui`/`sync_client`: the
+// embedded MCP server lives in a binary, never the lib, so `ccal` stays
+// tokio-free and Automerge stays sealed in `ccal::store`. `#[path]` keeps
+// the file out of `src/bin/` so cargo doesn't treat it as its own binary.
+#[path = "../server_mcp.rs"]
+mod mcp;
 
 /// Everything one document needs to be a shared peer: the merged replica,
 /// a change-notify so live connections re-run their sync loop when *another*
@@ -89,18 +101,76 @@ async fn main() -> Result<()> {
         docs: Mutex::new(HashMap::new()),
     });
 
-    let router = Router::new()
-        .route("/sync/:doc", get(sync_handler))
-        .with_state(app);
+    let mut router = Router::new().route("/sync/:doc", get(sync_handler));
+
+    // Optional embedded MCP server (opt-in via CCAL_MCP / `[server] mcp`).
+    // Built before `.with_state` and nested as a state-agnostic service —
+    // its handler carries the shared `Arc<Doc>` itself. Returns a
+    // CancellationToken so graceful shutdown also tears the MCP sessions
+    // down; `None` when disabled.
+    let mcp_ct = if cfg.server_mcp_enabled() {
+        let docid = cfg.server_mcp_doc();
+        // Pre-resolve (and start the debounced saver for) the very doc the
+        // assistant edits. A TUI later connecting to /sync/{docid} fetches
+        // this same `Arc<Doc>` from the map, so an MCP mutation's
+        // `dirty`/`changed` signals drive that peer's live sync — no new
+        // sync code, the existing `serve_peer` path does the rest.
+        let doc = doc_for(&app, &docid).await?;
+        let ct = CancellationToken::new();
+        let svc = StreamableHttpService::new(
+            move || Ok(mcp::Ccal::new(doc.clone())),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_cancellation_token(ct.child_token())
+                // The bearer gate + network layer (Tailscale/TLS) is the
+                // trust boundary, identical to the WS sync path which also
+                // does no Host check. The MCP client is a CLI assistant,
+                // not a browser, so DNS-rebinding isn't the threat; and the
+                // default loopback-only host list would otherwise reject a
+                // `0.0.0.0` bind reached by its Tailscale name.
+                .disable_allowed_hosts(),
+        );
+        let tok = app.token.clone();
+        let guarded = Router::new().nest_service("/mcp", svc).layer(
+            // Same check as `bearer()` on the WS upgrade, before any work.
+            middleware::from_fn(move |req: Request, next: Next| {
+                let tok = tok.clone();
+                async move {
+                    let ok = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|h| h.strip_prefix("Bearer "))
+                        == Some(tok.as_str());
+                    if ok {
+                        next.run(req).await
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "bad or missing bearer token")
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        router = router.merge(guarded);
+        eprintln!("ccal-server: MCP enabled at /mcp (doc `{docid}`)");
+        Some(ct)
+    } else {
+        None
+    };
+
+    let router = router.with_state(app);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
     eprintln!("ccal-server: listening on {addr}, data in {}", data_dir.display());
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             eprintln!("ccal-server: shutting down");
+            if let Some(ct) = mcp_ct {
+                ct.cancel();
+            }
         })
         .await
         .context("server error")?;

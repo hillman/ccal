@@ -47,3 +47,21 @@
 #           macOS ~/Library/Application Support/ccal-server)
 # Env override: CCAL_SYNC_DATA
 #data_dir = "/var/lib/ccal"
+
+# Optional embedded MCP server for LLM coding assistants (list/get/create/
+# update/move/rename/delete notes & todos). Served at /mcp on the SAME
+# address and behind the SAME bearer token as the sync path. OFF by
+# default: the surface is full read+write, so enabling it is deliberate.
+# It edits the live document and reuses the sync change-broadcast, so an
+# assistant's edits show up immediately in every connected ccal client.
+# Connect an assistant with e.g.:
+#   claude mcp add --transport http ccal http://your-server:8787/mcp \
+#     --header "Authorization: Bearer a-long-random-string"
+# Default: false   ·   Env override: CCAL_MCP (1/true/yes/on)
+#mcp = true
+
+# Which docid the MCP server reads/writes. Must match the docid your
+# clients sync (the last path segment of the client `url`), or the
+# assistant edits a different replica.
+# Default: "ccal"   ·   Env override: CCAL_MCP_DOC
+#mcp_doc = "ccal"

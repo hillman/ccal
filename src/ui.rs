@@ -93,9 +93,9 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
-    let at_root = app.cur.is_empty();
+    let flat = app.flat_list();
     let mut items: Vec<ListItem> = Vec::new();
-    if !at_root {
+    if !flat {
         items.push(ListItem::new(Span::styled(
             "📁 ..",
             Style::default().fg(Color::Blue),
@@ -107,23 +107,35 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
                 format!("📁 {name}/"),
                 Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
             )),
-            Entry::Note { title, .. } => ListItem::new(format!("  📄 {title}")),
+            Entry::Note { title, private, .. } => {
+                if *private {
+                    ListItem::new(Span::styled(
+                        format!("  🔒 {title}"),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                } else {
+                    ListItem::new(format!("  📄 {title}"))
+                }
+            }
         });
     }
 
-    let crumb = if at_root {
-        "/".to_string()
+    let title = if let Mode::Search { query } = &app.mode {
+        format!(" Search “{}”  ({} hits · Esc cancel) ", query, app.entries.len())
     } else {
-        format!("/{}", app.cur.join("/"))
+        let crumb = if flat {
+            "/".to_string()
+        } else {
+            format!("/{}", app.cur.join("/"))
+        };
+        format!(" Notes {crumb}  (n new · R rename · m move · p priv · d del · / search · r reload) ")
     };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Notes {crumb}  (n new · R rename · m move · d del · r reload) "
-        )))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
     let mut state = ListState::default();
-    let rows = app.entries.len() + if at_root { 0 } else { 1 };
+    let rows = app.entries.len() + if flat { 0 } else { 1 };
     if rows > 0 {
         state.select(Some(app.entry_sel));
     }
