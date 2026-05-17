@@ -62,13 +62,13 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let sel = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
     let unsel = Style::default().fg(Color::Cyan);
     let spans = vec![
-        Span::styled(" Todos ", if app.tab == Tab::Todos { sel } else { unsel }),
+        Span::styled(" [1] Todos ", if app.tab == Tab::Todos { sel } else { unsel }),
         Span::raw("  "),
-        Span::styled(" Notes ", if app.tab == Tab::Notes { sel } else { unsel }),
+        Span::styled(" [2] Notes ", if app.tab == Tab::Notes { sel } else { unsel }),
         Span::raw("  "),
-        Span::styled(" Calendar ", if app.tab == Tab::Calendar { sel } else { unsel }),
+        Span::styled(" [3] Calendar ", if app.tab == Tab::Calendar { sel } else { unsel }),
         Span::raw("  "),
-        Span::styled(" History ", if app.tab == Tab::History { sel } else { unsel }),
+        Span::styled(" [4] History ", if app.tab == Tab::History { sel } else { unsel }),
     ];
     let mut block = Block::default().borders(Borders::ALL).title(" ccal ");
     if let Some(s) = app.sync_indicator() {

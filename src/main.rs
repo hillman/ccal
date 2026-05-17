@@ -21,8 +21,20 @@ use app::App;
 
 fn main() -> Result<()> {
     let mut terminal = setup_terminal()?;
+    // Only the main UI thread owns the terminal, so only its panic should
+    // tear the alternate screen down. A background worker ("ccal-cal" /
+    // "ccal-sync") that panics is contained where it runs (see
+    // `cal_sync::refresh`'s `catch_unwind`); letting its panic restore the
+    // terminal here would corrupt a perfectly live UI — which is what made
+    // a bad calendar feed leave the screen wedged.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let worker = std::thread::current()
+            .name()
+            .is_some_and(|n| n == "ccal-cal" || n == "ccal-sync");
+        if worker {
+            return;
+        }
         let _ = restore_terminal();
         original_hook(info);
     }));

@@ -443,7 +443,7 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab | KeyCode::BackTab => {
                 let fwd = key.code == KeyCode::Tab;
-                self.tab = match (self.tab, fwd) {
+                let next = match (self.tab, fwd) {
                     (Tab::Todos, true) => Tab::Notes,
                     (Tab::Notes, true) => Tab::Calendar,
                     (Tab::Calendar, true) => Tab::History,
@@ -453,12 +453,12 @@ impl App {
                     (Tab::Calendar, false) => Tab::Notes,
                     (Tab::History, false) => Tab::Calendar,
                 };
-                if self.tab == Tab::History {
-                    self.enter_history();
-                } else if self.tab == Tab::Calendar {
-                    self.enter_calendar();
-                }
+                self.goto_tab(next);
             }
+            KeyCode::Char('1') => self.goto_tab(Tab::Todos),
+            KeyCode::Char('2') => self.goto_tab(Tab::Notes),
+            KeyCode::Char('3') => self.goto_tab(Tab::Calendar),
+            KeyCode::Char('4') => self.goto_tab(Tab::History),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             _ => match self.tab {
@@ -469,6 +469,15 @@ impl App {
             },
         }
         Ok(())
+    }
+
+    fn goto_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        if self.tab == Tab::History {
+            self.enter_history();
+        } else if self.tab == Tab::Calendar {
+            self.enter_calendar();
+        }
     }
 
     fn move_sel(&mut self, delta: isize) {

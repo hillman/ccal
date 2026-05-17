@@ -13,6 +13,7 @@
 //!
 //! Standalone-friendly: with no subscriptions the loop just idles cheaply.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -86,8 +87,7 @@ pub fn spawn(store: Arc<Mutex<Store>>, interval: Duration) -> Handle {
     thread::Builder::new()
         .name("ccal-cal".into())
         .spawn(move || loop {
-            refresh(&store, &agent, &occurrences, &statuses);
-            dirty.store(true, Ordering::SeqCst);
+            refresh(&store, &agent, &occurrences, &statuses, &dirty);
 
             // Wait out the interval, but wake early on a forced refresh.
             let ticks = (interval.as_millis() / TICK.as_millis()).max(1);
@@ -104,12 +104,24 @@ pub fn spawn(store: Arc<Mutex<Store>>, interval: Duration) -> Handle {
 }
 
 /// One refresh cycle: snapshot the subscriptions (brief lock), then fetch +
-/// expand each with the lock released.
+/// expand each with the lock released. Resilience is the point here — a
+/// single bad feed must never wedge the others or the UI:
+///
+/// * statuses are seeded as "fetching" and **published before** any network
+///   IO, so the manager shows the list immediately and a later hang/error
+///   on one feed can't read as "still fetching" for the rest;
+/// * parse/expand is wrapped in `catch_unwind` — a panic deep in
+///   `icalendar`/`rrule` on a malformed feed becomes that feed's error
+///   string, not a dead thread (which is what left the UI stuck on
+///   "fetching" indefinitely);
+/// * results are republished after **every** feed, so the agenda fills
+///   progressively and one slow/broken feed never hides the good ones.
 fn refresh(
     store: &Arc<Mutex<Store>>,
     agent: &ureq::Agent,
     occurrences: &Arc<Mutex<Vec<Occurrence>>>,
     statuses: &Arc<Mutex<Vec<CalStatus>>>,
+    dirty: &Arc<AtomicBool>,
 ) {
     let cals = store
         .lock()
@@ -120,60 +132,84 @@ fn refresh(
     let start = now - chrono::Duration::days(BACK);
     let end = now + chrono::Duration::days(FORWARD);
 
-    let mut all: Vec<Occurrence> = Vec::new();
-    let mut stats: Vec<CalStatus> = Vec::new();
-
-    for cal in &cals {
-        let mut st = CalStatus {
-            id: cal.id.clone(),
-            name: if cal.name.is_empty() { cal.url.clone() } else { cal.name.clone() },
+    let mut stats: Vec<CalStatus> = cals
+        .iter()
+        .map(|c| CalStatus {
+            id: c.id.clone(),
+            name: if c.name.is_empty() { c.url.clone() } else { c.name.clone() },
             last_ok: 0,
             error: None,
             events: 0,
-        };
+        })
+        .collect();
+
+    let publish_status = |stats: &[CalStatus]| {
+        *statuses.lock().unwrap_or_else(|e| e.into_inner()) = stats.to_vec();
+        dirty.store(true, Ordering::SeqCst);
+    };
+    // Show the subscription list right away, before the first GET.
+    publish_status(&stats);
+
+    let mut all: Vec<Occurrence> = Vec::new();
+    for (i, cal) in cals.iter().enumerate() {
         match fetch(agent, &cal.url) {
+            Err(e) => stats[i].error = Some(e),
             Ok(ics) => {
-                // Backfill a missing name from the feed itself, once. This
-                // is a doc write, so it rides the normal sync path.
+                // Backfill a missing name from the feed (a synced doc
+                // write). `icalendar` parsing can panic on some inputs, so
+                // contain it like the expand below.
                 if cal.name.is_empty() {
-                    if let Some(name) = calendar::calendar_name(&ics).filter(|n| !n.is_empty()) {
+                    let name = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        calendar::calendar_name(&ics)
+                    }))
+                    .ok()
+                    .flatten()
+                    .filter(|n| !n.is_empty());
+                    if let Some(name) = name {
                         let mut g = store.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = g.set_calendar_name(&cal.id, &name);
                         let _ = g.save();
-                        st.name = name;
+                        stats[i].name = name;
                     }
                 }
-                match calendar::expand(&ics, &st.name, start, end) {
-                    Ok(mut occ) => {
-                        st.events = occ.len();
-                        st.last_ok = now_ms();
+                let nm = stats[i].name.clone();
+                let expanded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    calendar::expand(&ics, &nm, start, end)
+                }));
+                match expanded {
+                    Ok(Ok(mut occ)) => {
+                        stats[i].events = occ.len();
+                        stats[i].last_ok = now_ms();
                         all.append(&mut occ);
                     }
-                    Err(e) => st.error = Some(format!("parse: {e}")),
+                    Ok(Err(e)) => stats[i].error = Some(format!("parse: {e}")),
+                    Err(_) => {
+                        stats[i].error = Some("could not parse this feed (skipped)".into())
+                    }
                 }
             }
-            Err(e) => st.error = Some(e),
         }
-        stats.push(st);
+        // Republish after each feed: progressive fill; a later failure
+        // can't blank what already succeeded.
+        *occurrences.lock().unwrap_or_else(|e| e.into_inner()) = merge(all.clone());
+        publish_status(&stats);
     }
+}
 
-    // Real feeds dupe heavily: the same event subscribed via two calendars,
-    // and recurring master/override pairs. Collapse anything identical in
-    // start, end and summary (sort so exact dupes are adjacent, then
-    // `dedup_by` keeps the first). Cross-calendar dupes are intentionally
-    // merged — a glance agenda wants one row, not "in 2 calendars".
-    all.sort_by(|a, b| {
+/// Real feeds dupe heavily: the same event subscribed via two calendars,
+/// and recurring master/override pairs. Sort so exact dupes are adjacent,
+/// then collapse anything identical in start, end and summary (`dedup_by`
+/// keeps the first). Cross-calendar dupes are intentionally merged — a
+/// glance agenda wants one row, not "in 2 calendars".
+fn merge(mut v: Vec<Occurrence>) -> Vec<Occurrence> {
+    v.sort_by(|a, b| {
         a.start
             .cmp(&b.start)
             .then_with(|| a.end.cmp(&b.end))
             .then_with(|| a.summary.cmp(&b.summary))
     });
-    all.dedup_by(|a, b| {
-        a.start == b.start && a.end == b.end && a.summary == b.summary
-    });
-
-    *occurrences.lock().unwrap_or_else(|e| e.into_inner()) = all;
-    *statuses.lock().unwrap_or_else(|e| e.into_inner()) = stats;
+    v.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.summary == b.summary);
+    v
 }
 
 /// Blocking HTTPS GET of one ICS feed. Errors are short, human strings (the
