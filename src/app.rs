@@ -2,12 +2,17 @@
 //! The notes "folders" are a virtual tree derived from each note's
 //! `folder` array — there is no folder entity and no filesystem.
 
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use anyhow::Result;
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use ccal::models::{NoteMeta, Todo};
 use ccal::store::Store;
+
+use crate::sync_client;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Tab {
@@ -34,7 +39,15 @@ pub enum Entry {
 }
 
 pub struct App {
-    store: Store,
+    /// Shared with the background sync thread (if any). The lock is held
+    /// only for individual store calls — never across a redraw or IO.
+    store: Arc<Mutex<Store>>,
+    /// `None` in standalone mode (no `CCAL_SYNC_URL`) — the rest of the app
+    /// is byte-for-byte the same code path either way.
+    sync: Option<sync_client::Handle>,
+    /// Last sync status string surfaced to the bar, so a steady connection
+    /// state doesn't keep stomping transient action messages.
+    last_sync: String,
     pub tab: Tab,
     pub mode: Mode,
     pub should_quit: bool,
@@ -54,9 +67,24 @@ pub struct App {
 
 impl App {
     pub fn new() -> Result<Self> {
-        let store = Store::open()?;
+        let store = Arc::new(Mutex::new(Store::open()?));
+
+        // Standalone unless told otherwise. `CCAL_SYNC_URL` like
+        // `ws://host:8787/sync/ccal`; token from `CCAL_SYNC_TOKEN`.
+        let sync = match (
+            std::env::var("CCAL_SYNC_URL"),
+            std::env::var("CCAL_SYNC_TOKEN"),
+        ) {
+            (Ok(url), Ok(token)) if !url.is_empty() && !token.is_empty() => {
+                Some(sync_client::spawn(store.clone(), url, token))
+            }
+            _ => None,
+        };
+
         let mut app = Self {
             store,
+            sync,
+            last_sync: String::new(),
             tab: Tab::Todos,
             mode: Mode::Normal,
             should_quit: false,
@@ -73,23 +101,64 @@ impl App {
         Ok(app)
     }
 
+    /// Brief lock on the shared store. Every call site takes it for one
+    /// store operation and drops it on the same statement — the sync thread
+    /// must never wait behind the UI.
+    fn st(&self) -> MutexGuard<'_, Store> {
+        self.store.lock().expect("store mutex poisoned")
+    }
+
     fn persist(&mut self) {
-        if let Err(e) = self.store.save() {
+        let r = self.st().save();
+        if let Err(e) = r {
             self.status = format!("Save failed: {e}");
         }
     }
 
+    /// Called once per UI loop: fold in anything the background sync thread
+    /// merged, and surface connection state without clobbering transient
+    /// action messages.
+    pub fn tick(&mut self) {
+        let Some(sync) = &self.sync else { return };
+        let dirty = sync.dirty.clone();
+        let status_arc = sync.status.clone();
+
+        let remote_changed = dirty.swap(false, Ordering::SeqCst);
+        if remote_changed {
+            // Rebuild the lists. Deliberately does NOT touch `editor`: a
+            // remote edit to the note you're typing in still merges in the
+            // doc (char-level Text CRDT) and is reconciled on next open;
+            // yanking the buffer mid-keystroke would be worse.
+            self.refresh();
+        }
+
+        let cur = status_arc.lock().map(|s| s.clone()).unwrap_or_default();
+        let editing = !matches!(self.mode, Mode::Normal);
+        if cur != self.last_sync {
+            self.last_sync = cur.clone();
+            if !editing {
+                self.status = cur;
+            }
+        } else if remote_changed && !editing {
+            self.status = "Synced".into();
+        }
+    }
+
     fn refresh(&mut self) {
-        self.todos = self.store.todos();
+        let todos = self.st().todos();
+        self.todos = todos;
         self.entries = self.build_entries();
         self.clamp();
     }
 
     /// Reload the document from disk (picks up an external `import-bear`).
+    /// Replaces the *inner* doc so the sync thread keeps the same shared
+    /// handle. Note: doing this while sync is live makes the peer resync
+    /// from scratch — fine for the import-bear use case, just not free.
     fn reload(&mut self) {
         match Store::open() {
             Ok(s) => {
-                self.store = s;
+                *self.st() = s;
                 self.refresh();
                 self.status = "Reloaded from disk".into();
             }
@@ -98,7 +167,7 @@ impl App {
     }
 
     fn build_entries(&self) -> Vec<Entry> {
-        let notes = self.store.note_metas();
+        let notes = self.st().note_metas();
         let depth = self.cur.len();
         let mut dirs: Vec<String> = Vec::new();
         let mut here: Vec<&NoteMeta> = Vec::new();
@@ -199,7 +268,7 @@ impl App {
             }
             KeyCode::Char('d') if !self.todos.is_empty() => {
                 let id = self.todos[self.todo_sel].id.clone();
-                self.store.delete_todo(&id)?;
+                self.st().delete_todo(&id)?;
                 self.persist();
                 self.refresh();
                 self.status = "Todo deleted".into();
@@ -208,7 +277,7 @@ impl App {
                 let i = self.todo_sel;
                 if i + 1 < self.todos.len() {
                     let (a, b) = (self.todos[i].id.clone(), self.todos[i + 1].id.clone());
-                    self.store.swap_todo_order(&a, &b)?;
+                    self.st().swap_todo_order(&a, &b)?;
                     self.persist();
                     self.refresh();
                     self.todo_sel = i + 1;
@@ -218,7 +287,7 @@ impl App {
                 let i = self.todo_sel;
                 if i > 0 {
                     let (a, b) = (self.todos[i].id.clone(), self.todos[i - 1].id.clone());
-                    self.store.swap_todo_order(&a, &b)?;
+                    self.st().swap_todo_order(&a, &b)?;
                     self.persist();
                     self.refresh();
                     self.todo_sel = i - 1;
@@ -259,7 +328,7 @@ impl App {
                     self.entries = self.build_entries();
                 }
                 Some(Entry::Note { id, title }) => {
-                    let body = self.store.note(&id).map(|n| n.body).unwrap_or_default();
+                    let body = self.st().note(&id).map(|n| n.body).unwrap_or_default();
                     self.editor = make_editor(&body);
                     self.mode = Mode::NoteEdit { id, title };
                     self.status = "Editing (NORMAL) — i insert · q save & close".into();
@@ -272,7 +341,7 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if let Some(Entry::Note { id, title }) = self.selected().cloned() {
-                    self.store.delete_note(&id)?;
+                    self.st().delete_note(&id)?;
                     self.persist();
                     self.entries = self.build_entries();
                     self.clamp();
@@ -304,7 +373,7 @@ impl App {
                 match prompt {
                     Prompt::AddTodo => {
                         if !text.is_empty() {
-                            self.store.add_todo(&text)?;
+                            self.st().add_todo(&text)?;
                             self.persist();
                             self.refresh();
                             self.todo_sel = self.todos.len().saturating_sub(1);
@@ -315,7 +384,7 @@ impl App {
                     Prompt::EditTodo(id) => {
                         let id = id.clone();
                         if !text.is_empty() {
-                            self.store.set_todo_text(&id, &text)?;
+                            self.st().set_todo_text(&id, &text)?;
                             self.persist();
                             self.refresh();
                         }
@@ -328,7 +397,7 @@ impl App {
                             self.status = "Empty name — cancelled".into();
                         } else {
                             let cur = self.cur.clone();
-                            let id = self.store.create_note(&cur, &text)?;
+                            let id = self.st().create_note(&cur, &text)?;
                             self.persist();
                             self.entries = self.build_entries();
                             self.editor = make_editor("");
@@ -352,7 +421,7 @@ impl App {
         if let Mode::NoteEdit { id, .. } = &self.mode {
             let id = id.clone();
             let content = self.editor.lines.to_string();
-            self.store.set_note_body(&id, &content)?;
+            self.st().set_note_body(&id, &content)?;
             self.persist();
         }
         Ok(())

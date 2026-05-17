@@ -18,9 +18,15 @@
 //! - `todos`:  Map  id -> { text:Str, order:F64, created:Int }
 
 use anyhow::{anyhow, Context, Result};
-use automerge::transaction::Transactable;
-use automerge::{Automerge, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT};
-use std::path::PathBuf;
+use automerge::sync::{Message as AmSyncMessage, SyncDoc};
+use automerge::transaction::{CommitOptions, Transactable};
+use automerge::{ActorId, Automerge, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT};
+use std::path::{Path, PathBuf};
+
+/// Per-peer sync state for the Automerge sync protocol. Opaque to callers;
+/// create one with [`SyncState::default`] per connected peer and keep it for
+/// the life of that connection.
+pub use automerge::sync::State as SyncState;
 
 use crate::models::{new_id, now_ms, Note, NoteInput, NoteMeta, Todo};
 
@@ -41,17 +47,62 @@ fn data_path() -> Result<PathBuf> {
     Ok(dir.join("ccal.automerge"))
 }
 
+/// The canonical empty document every replica starts from.
+///
+/// A fixed actor id and a fixed commit timestamp make the genesis change
+/// byte-for-byte identical on every machine, so all replicas share one
+/// common ancestor and resolve `notes`/`todos` to the *same* object id.
+/// This is the precondition for the Automerge sync protocol to converge —
+/// without it, independently created root maps conflict permanently.
+fn genesis_doc() -> Automerge {
+    let actor: ActorId = "cca100000000cca100000000"
+        .parse()
+        .expect("valid genesis actor id");
+    let mut doc = Automerge::new().with_actor(actor);
+    let mut tx = doc.transaction();
+    tx.put(ROOT, "schema", SCHEMA).expect("genesis schema");
+    tx.put_object(ROOT, "notes", ObjType::Map)
+        .expect("genesis notes map");
+    tx.put_object(ROOT, "todos", ObjType::Map)
+        .expect("genesis todos map");
+    tx.commit_with(CommitOptions::default().with_time(0));
+    doc
+}
+
 impl Store {
-    /// Open the store from disk, creating an empty document if absent.
+    /// Open the store from the default ccal data directory, creating an empty
+    /// document if absent.
     pub fn open() -> Result<Self> {
-        let path = data_path()?;
+        Self::open_at(data_path()?)
+    }
+
+    /// Open the store from an explicit path (used by the sync server, which
+    /// keeps its replica outside the interactive client's data dir),
+    /// creating an empty document if absent.
+    pub fn open_at(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let mut doc = if path.exists() {
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             Automerge::load(&bytes).context("parsing Automerge document")?
         } else {
-            Automerge::new()
+            // Fresh replica: start from the shared genesis, NOT a blank
+            // doc. Two blank docs would each `put_object` their own
+            // `notes`/`todos` maps with no common ancestor; after sync the
+            // root keys conflict and writes land in different objects that
+            // never converge. Genesis gives every replica (client and
+            // server alike) one byte-identical ancestor.
+            genesis_doc()
         };
+
+        // The genesis actor signs *only* the genesis change. Every replica
+        // must make its own subsequent edits under a distinct actor, or two
+        // replicas both writing as the genesis actor collide ("duplicate
+        // seq"). A fresh actor per open is fine for Automerge.
+        doc.set_actor(ActorId::random());
 
         let mut tx = doc.transaction();
         if tx.get(ROOT, "schema")?.is_none() {
@@ -72,6 +123,47 @@ impl Store {
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path).context("replacing store file")?;
         Ok(())
+    }
+
+    // ---- Sync ----------------------------------------------------------
+    //
+    // Thin facade over `automerge`'s sync protocol so Automerge stays
+    // entirely inside this module. The server/client transport layers deal
+    // only in opaque `SyncState` + raw message bytes; they never see an
+    // `Automerge`. Remote changes land via the low-level sync API, never
+    // through `AutoCommit`.
+
+    /// Produce the next sync message for a peer, or `None` if that peer is
+    /// already up to date. `state` must be the same value across calls for
+    /// the life of one peer connection.
+    pub fn generate_sync_message(&mut self, state: &mut SyncState) -> Option<Vec<u8>> {
+        self.doc
+            .generate_sync_message(state)
+            .map(AmSyncMessage::encode)
+    }
+
+    /// Apply a sync message received from a peer. Returns `true` if it
+    /// changed the document (i.e. callers should persist / refresh).
+    pub fn receive_sync_message(
+        &mut self,
+        state: &mut SyncState,
+        msg: &[u8],
+    ) -> Result<bool> {
+        let msg = AmSyncMessage::decode(msg).context("decoding sync message")?;
+        let heads_before = self.doc.get_heads();
+        self.doc
+            .receive_sync_message(state, msg)
+            .context("applying sync message")?;
+        // Re-resolve the cached container ids: a merge can change which
+        // object wins at ROOT["notes"]/["todos"] (legacy docs predating the
+        // shared genesis), and a stale id would silently read the wrong map.
+        if let Ok(Some((Value::Object(_), id))) = self.doc.get(ROOT, "notes") {
+            self.notes = id;
+        }
+        if let Ok(Some((Value::Object(_), id))) = self.doc.get(ROOT, "todos") {
+            self.todos = id;
+        }
+        Ok(self.doc.get_heads() != heads_before)
     }
 
     // ---- Notes ---------------------------------------------------------
@@ -355,4 +447,54 @@ fn ensure_map<T: Transactable>(tx: &mut T, key: &str) -> Result<ObjId> {
         return Ok(id);
     }
     Ok(tx.put_object(ROOT, key, ObjType::Map)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive the sync protocol between two stores to quiescence, the way the
+    /// server loop will: each side generates while it has something to send,
+    /// the other receives, repeat until both fall silent.
+    fn sync(a: &mut Store, b: &mut Store) {
+        let (mut sa, mut sb) = (SyncState::new(), SyncState::new());
+        loop {
+            let mut moved = false;
+            if let Some(m) = a.generate_sync_message(&mut sa) {
+                moved = true;
+                b.receive_sync_message(&mut sb, &m).unwrap();
+            }
+            if let Some(m) = b.generate_sync_message(&mut sb) {
+                moved = true;
+                a.receive_sync_message(&mut sa, &m).unwrap();
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn two_stores_converge() {
+        let dir = std::env::temp_dir().join(format!("ccal-synctest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+
+        let id = a
+            .create_note(&["work".to_string()], "from A")
+            .unwrap();
+        sync(&mut a, &mut b);
+        assert_eq!(b.note(&id).map(|n| n.title), Some("from A".to_string()));
+
+        // Concurrent edits on each side, then a round trip: both converge
+        // and neither edit is lost (char-level Text merge).
+        a.set_note_body(&id, "alpha").unwrap();
+        let id2 = b.add_todo("from B").unwrap();
+        sync(&mut a, &mut b);
+        assert_eq!(a.note(&id).map(|n| n.body), Some("alpha".to_string()));
+        assert!(b.todos().iter().any(|t| t.id == id2 && t.text == "from B"));
+        assert!(a.todos().iter().any(|t| t.id == id2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

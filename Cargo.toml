@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "import-bear"
 path = "src/bin/import-bear.rs"
 
+[[bin]]
+name = "ccal-server"
+path = "src/bin/ccal-server.rs"
+
 [dependencies]
 automerge = "0.7"
 uuid = { version = "1", features = ["v4"] }
@@ -25,6 +29,20 @@ anyhow = "1"
 # stay aligned with both ratatui and edtui.
 ratatui = "0.30"
 edtui = "0.11"
+# Blocking WebSocket client for the background sync thread (no TLS / no
+# tokio: ws:// only, intended to run inside Tailscale). Default features
+# only — adding wss:// later means a TLS feature here, not a rewrite.
+tungstenite = "0.24"
 
 # import-bear binary only
 serde_json = "1"
+
+# ccal-server binary only. axum brings its own WebSocket support, so no
+# separate tungstenite. Lib stays tokio-free; all async lives in the binary.
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+
+[dev-dependencies]
+# End-to-end test drives the real ccal-server binary over WebSockets.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

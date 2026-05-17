@@ -2,6 +2,7 @@
 //! (`import-bear`) and is intentionally not reachable from here.
 
 mod app;
+mod sync_client;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -33,6 +34,7 @@ fn main() -> Result<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new()?;
     while !app.should_quit {
+        app.tick(); // fold in anything the background sync thread merged
         terminal.draw(|f| ui::draw(f, &app))?;
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
