@@ -48,6 +48,18 @@ pub enum Mode {
     Search { query: String },
 }
 
+/// Half-finished `g`-prefixed bookmark chord, awaiting its next key. Only
+/// ever set in [`Mode::Normal`]; consumed by the next keystroke so it can
+/// never linger across a mode change.
+#[derive(Clone, Copy)]
+pub enum Pending {
+    /// `g` seen — next key is either `m` (→ [`Pending::SetMark`]) or the
+    /// bookmark to jump to.
+    Goto,
+    /// `gm` seen — next key names the bookmark to point at the selected note.
+    SetMark,
+}
+
 #[derive(Clone)]
 pub enum Entry {
     Dir(String),
@@ -78,6 +90,8 @@ pub struct App {
     last_sync: String,
     pub tab: Tab,
     pub mode: Mode,
+    /// In-flight `g`-chord, if any (see [`Pending`]).
+    pending: Option<Pending>,
     pub should_quit: bool,
     pub status: String,
 
@@ -145,6 +159,7 @@ impl App {
             last_sync: String::new(),
             tab: Tab::Todos,
             mode: Mode::Normal,
+            pending: None,
             should_quit: false,
             status: "Tab: switch · q: quit".into(),
             todos: Vec::new(),
@@ -439,8 +454,19 @@ impl App {
     // ---- Normal --------------------------------------------------------
 
     fn normal_key(&mut self, key: KeyEvent) -> Result<()> {
+        // A `g`-chord in flight swallows the next key whole — before any
+        // normal binding (incl. the 1-4 tab jumps and j/k) gets a look, so
+        // a bookmark named `2` or `j` still works.
+        if let Some(p) = self.pending.take() {
+            self.pending_key(p, key);
+            return Ok(());
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('g') => {
+                self.pending = Some(Pending::Goto);
+                self.status = "g — m: set bookmark · a-z/0-9: go to bookmark · Esc: cancel".into();
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 let fwd = key.code == KeyCode::Tab;
                 let next = match (self.tab, fwd) {
@@ -478,6 +504,90 @@ impl App {
         } else if self.tab == Tab::Calendar {
             self.enter_calendar();
         }
+    }
+
+    /// Second/third keystroke of a `g`-chord. `Esc` (or any non-bookmark
+    /// key) cancels; bookmark keys are the alphanumerics minus `m`, which
+    /// is reserved as the `gm` set-prefix.
+    fn pending_key(&mut self, p: Pending, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.status = "Cancelled".into();
+            return;
+        }
+        match p {
+            Pending::Goto => match key.code {
+                KeyCode::Char('m') => {
+                    self.pending = Some(Pending::SetMark);
+                    self.status =
+                        "Set bookmark — press a-z/0-9 (on the note to bookmark) · Esc: cancel"
+                            .into();
+                }
+                KeyCode::Char(c) if c.is_alphanumeric() => self.jump_mark(c),
+                _ => self.status = "Not a bookmark key".into(),
+            },
+            Pending::SetMark => match key.code {
+                KeyCode::Char(c) if c.is_alphanumeric() => self.set_mark(c),
+                _ => self.status = "Not a bookmark key".into(),
+            },
+        }
+    }
+
+    /// `gm{c}`: point bookmark `c` at the note under the cursor. Only the
+    /// Notes tab has a "current note"; anywhere else there's nothing to
+    /// bookmark.
+    fn set_mark(&mut self, c: char) {
+        let Some(Entry::Note { id, title, .. }) =
+            (self.tab == Tab::Notes).then(|| self.selected().cloned()).flatten()
+        else {
+            self.status = "Select a note (Notes tab) before setting a bookmark".into();
+            return;
+        };
+        let r = self.st().set_mark(c, &id);
+        match r {
+            Ok(()) => {
+                self.persist();
+                self.status = format!("Bookmark '{c}' → {title}");
+            }
+            Err(e) => self.status = format!("Set bookmark failed: {e}"),
+        }
+    }
+
+    /// `g{c}`: open the bookmarked note in the editor from anywhere. A
+    /// stale bookmark (note since deleted) reports rather than silently
+    /// doing nothing.
+    fn jump_mark(&mut self, c: char) {
+        let Some(id) = self.st().mark(c) else {
+            self.status = format!("No bookmark '{c}'");
+            return;
+        };
+        if !self.open_note_by_id(&id) {
+            self.status = format!("Bookmark '{c}' points at a deleted note");
+        }
+    }
+
+    /// Switch to the Notes tab, descend to the note's folder, select it,
+    /// and open it in the editor. Returns `false` (no-op) if the id no
+    /// longer resolves. Shared by bookmark-jump and any future jump-to.
+    fn open_note_by_id(&mut self, id: &str) -> bool {
+        let Some(note) = self.st().note(id) else {
+            return false;
+        };
+        self.tab = Tab::Notes;
+        self.cur = note.folder.clone();
+        self.entries = self.build_entries();
+        // Land the list cursor on the note too, so closing the editor
+        // returns here in context rather than to a stale selection. The
+        // leading ".." row (present unless the list is flat) shifts the
+        // index by one — mirror `selected()`'s convention.
+        if let Some(i) = self.entries.iter().position(
+            |e| matches!(e, Entry::Note { id: nid, .. } if nid == id),
+        ) {
+            self.entry_sel = if self.flat_list() { i } else { i + 1 };
+        }
+        self.editor = make_editor(&note.body);
+        self.mode = Mode::NoteEdit { id: id.to_string(), title: note.title };
+        self.status = "Editing (NORMAL) — i insert · q save & close".into();
+        true
     }
 
     fn move_sel(&mut self, delta: isize) {

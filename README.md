@@ -18,6 +18,14 @@ at a glance.
 - **Vim note editor.** Modal editing via [edtui](https://github.com/preiter93/edtui)
   with markdown syntax highlighting; app keys only fire in Normal mode, so
   typing never triggers a command.
+- **Live preview pane.** The Notes tab's right pane shows the selected
+  note's body (or a folder's contents) as you move the cursor — read
+  things at a glance without opening the editor.
+- **Jump-anywhere navigation.** Tabs are numbered `[1]`–`[4]`; press the
+  number to go straight there from any screen. Plus Vim-style **global
+  note bookmarks**: `gm{key}` bookmarks the selected note, `g{key}`
+  reopens it from anywhere — and bookmarks sync across devices like
+  everything else.
 - **Offline-first sync, no conflicts.** The store *is* a CRDT (Automerge):
   every device works fully offline and converges automatically, with
   **character-level merge** of concurrent edits to the same note — edits
@@ -72,6 +80,36 @@ I've built it in Rust for a nice quick UI and easy executable builds.  It uses A
 
 It's using edtui for the note editor - that uses vim bindings, because I love vim and have it in my fingers.  Sorry, it's an opionated choice.  It'd be easy enough to implement a config flag for a simpler edit component though if anyone wants it. PR welcome.
 
+
+## Navigation & bookmarks
+
+Getting around is keyboard-only and designed so you never have to tab
+through things you don't want.
+
+**Tabs.** The tab bar is numbered — `[1] Todos`, `[2] Notes`,
+`[3] Calendar`, `[4] History`. Press the number to jump straight to that
+tab from anywhere (any tab, any panel) while in Normal mode. `Tab` /
+`Shift+Tab` still cycle if you prefer. Numbers are only intercepted in
+Normal mode, so they never fire while you're typing a note name, a todo,
+a search, or editing a note body.
+
+**Global note bookmarks.** Vim-style marks for notes that work across the
+whole app and sync between devices:
+
+- **Set:** with a note selected in the Notes list, press `g` then `m`
+  then a key (any letter or digit) — e.g. `gmw` bookmarks the previewed
+  note under `w`.
+- **Jump:** press `g` then that key — e.g. `gw` — from *any* tab to open
+  the bookmarked note in the editor. It also drops you into that note's
+  folder, so closing the editor lands you back there in context.
+- The status bar prompts you after `g`, and `Esc` cancels the chord.
+  `m` is reserved as the set-prefix, so it can't be a bookmark key
+  itself; every other alphanumeric can. A bookmark pointing at a
+  since-deleted note says so rather than doing nothing.
+
+Bookmarks live in the synced document, so they persist across restarts
+and appear on every device — like Vim's uppercase global marks, but
+shared.
 
 ## Sync
 Automerge is both the storage format and the sync protocol — it's designed for offline-first distributed synchronisation. `ccal-server` is a small always-on **peer** you run on your own machine: clients all point at it, it merges everything server-side, rebroadcasts so other connected clients converge live, and acts as a free plaintext backup of the whole corpus. No database, no schema, no migrations. It's intended to run behind Tailscale, so the server itself doesn't do transport encryption — you let Tailscale do that — though a bearer token is still checked at the handshake regardless.

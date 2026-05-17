@@ -49,6 +49,15 @@ const SCHEMA: i64 = 1;
 /// container, so it converges with no genesis change.
 const CAL_PREFIX: &str = "cal/";
 
+/// Prefix for global bookmark ROOT keys (`mark/<char>` -> note id). Like
+/// `cal/`, each mark is its own scalar `ROOT` entry, not a child of a
+/// shared container — so it converges with no genesis change AND is safe
+/// for the multi-writer TUI clients (the lazy single-container trick used
+/// by `checkpoints` is only sound for the single-writer server). A
+/// concurrent set of the same key resolves deterministically to one note,
+/// which is acceptable last-writer-wins semantics for a bookmark.
+const MARK_PREFIX: &str = "mark/";
+
 /// Wall-clock seconds — Automerge change timestamps are unix *seconds*.
 fn now_secs() -> i64 {
     now_ms() / 1000
@@ -720,6 +729,45 @@ impl Store {
                 .cmp(&b.name.to_lowercase())
                 .then_with(|| a.id.cmp(&b.id))
         });
+        v
+    }
+
+    // ---- Marks ---------------------------------------------------------
+    //
+    // Global note bookmarks: a single user-chosen char keyed straight on
+    // ROOT (`mark/<char>`) holding the target note id as a scalar string.
+    // No container is ever created, so there is nothing for two clients to
+    // concurrently seed — the divergence hazard simply does not exist here.
+
+    /// Point bookmark `key` at `note_id` (overwrites any previous target).
+    pub fn set_mark(&mut self, key: char, note_id: &str) -> Result<()> {
+        let k = format!("{MARK_PREFIX}{key}");
+        let mut tx = self.doc.transaction();
+        tx.put(ROOT, k.as_str(), note_id)?;
+        commit(tx);
+        Ok(())
+    }
+
+    /// The note id bookmark `key` points at, if it has ever been set.
+    pub fn mark(&self, key: char) -> Option<String> {
+        let k = format!("{MARK_PREFIX}{key}");
+        let s = get_str(&self.doc, &ROOT, &k);
+        (!s.is_empty()).then_some(s)
+    }
+
+    /// Every set bookmark, as `(key, note_id)`, sorted by key.
+    pub fn marks(&self) -> Vec<(char, String)> {
+        let mut v: Vec<(char, String)> = self
+            .doc
+            .keys(ROOT)
+            .filter(|k| k.starts_with(MARK_PREFIX))
+            .filter_map(|k| {
+                let key = k[MARK_PREFIX.len()..].chars().next()?;
+                let id = get_str(&self.doc, &ROOT, &k);
+                (!id.is_empty()).then_some((key, id))
+            })
+            .collect();
+        v.sort_by_key(|(k, _)| *k);
         v
     }
 
