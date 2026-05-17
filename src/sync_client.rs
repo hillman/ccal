@@ -141,7 +141,7 @@ fn session(
         // 1. Push everything the protocol currently owes the server.
         loop {
             let next = {
-                let mut st = store.lock().unwrap();
+                let mut st = store.lock().unwrap_or_else(|e| e.into_inner());
                 st.generate_sync_message(&mut state)
             };
             match next {
@@ -163,14 +163,14 @@ fn session(
             Ok(Message::Binary(bytes)) => {
                 last_sync.store(now_ms(), Ordering::SeqCst);
                 let changed = {
-                    let mut st = store.lock().unwrap();
+                    let mut st = store.lock().unwrap_or_else(|e| e.into_inner());
                     st.receive_sync_message(&mut state, &bytes)
                         .map_err(|e| format!("apply: {e}"))?
                 };
                 if changed {
                     store
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .save()
                         .map_err(|e| format!("save: {e}"))?;
                     dirty.store(true, Ordering::SeqCst);

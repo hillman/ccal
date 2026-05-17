@@ -20,7 +20,7 @@
 use anyhow::{anyhow, Context, Result};
 use automerge::sync::{Message as AmSyncMessage, SyncDoc};
 use automerge::transaction::{CommitOptions, Transactable, Transaction};
-use automerge::{ActorId, Automerge, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT};
+use automerge::{ActorId, Automerge, ObjId, ObjType, Prop, ReadDoc, ScalarValue, Value, ROOT};
 use std::path::{Path, PathBuf};
 
 /// Per-peer sync state for the Automerge sync protocol. Opaque to callers;
@@ -320,18 +320,7 @@ impl Store {
     }
 
     fn read_note(&self, id: &str) -> Option<Note> {
-        let obj = child(&self.doc, &self.notes, id)?;
-        Some(Note {
-            id: id.to_string(),
-            title: get_str(&self.doc, &obj, "title"),
-            folder: get_folder(&self.doc, &obj),
-            body: child(&self.doc, &obj, "body")
-                .and_then(|b| self.doc.text(&b).ok())
-                .unwrap_or_default(),
-            created: get_i64(&self.doc, &obj, "created"),
-            modified: get_i64(&self.doc, &obj, "modified"),
-            private: get_bool(&self.doc, &obj, "private"),
-        })
+        note_view(&self.doc, &self.notes, id, At::Now)
     }
 
     /// Create an empty note in `folder`, returning its new id.
@@ -738,10 +727,10 @@ impl Store {
                 ));
             }
         }
-        let target_notes = all_notes_at(&self.doc, &self.notes, heads);
-        let target_todos = all_todos_at(&self.doc, &self.todos, heads);
-        let live_notes = all_notes(&self.doc, &self.notes);
-        let live_todos = all_todos(&self.doc, &self.todos);
+        let target_notes = all_notes(&self.doc, &self.notes, At::Heads(heads));
+        let target_todos = all_todos(&self.doc, &self.todos, At::Heads(heads));
+        let live_notes = all_notes(&self.doc, &self.notes, At::Now);
+        let live_todos = all_todos(&self.doc, &self.todos, At::Now);
 
         use std::collections::{BTreeMap, BTreeSet};
         let live_n: BTreeMap<&str, &Note> =
@@ -966,16 +955,64 @@ struct RestorePlan {
 
 // ---- Free read helpers (work against any ReadDoc) ----------------------
 
-fn child<D: ReadDoc>(d: &D, parent: &ObjId, key: &str) -> Option<ObjId> {
-    match d.get(parent, key) {
-        Ok(Some((Value::Object(_), id))) => Some(id),
+// One reader family, optionally "as at heads". `At::Now` reads the live
+// doc; `At::Heads(h)` reads the clock-based `*_at` view (used by restore —
+// never `fork_at`, which hits the upstream `MissingOps` panic). Threading
+// `At` through a single set of readers means note/todo materialization has
+// exactly ONE definition, so a new field can't be added to one path and
+// silently forgotten on the other.
+#[derive(Clone, Copy)]
+enum At<'a> {
+    Now,
+    Heads(&'a [ChangeHash]),
+}
+
+fn aget<'a, D: ReadDoc>(
+    d: &'a D,
+    obj: &ObjId,
+    prop: impl Into<Prop>,
+    at: At,
+) -> Option<(Value<'a>, ObjId)> {
+    match at {
+        At::Now => d.get(obj, prop),
+        At::Heads(h) => d.get_at(obj, prop, h),
+    }
+    .ok()
+    .flatten()
+}
+
+fn akeys<D: ReadDoc>(d: &D, obj: &ObjId, at: At) -> Vec<String> {
+    match at {
+        At::Now => d.keys(obj).collect(),
+        At::Heads(h) => d.keys_at(obj, h).collect(),
+    }
+}
+
+fn atext<D: ReadDoc>(d: &D, obj: &ObjId, at: At) -> String {
+    match at {
+        At::Now => d.text(obj),
+        At::Heads(h) => d.text_at(obj, h),
+    }
+    .unwrap_or_default()
+}
+
+fn alen<D: ReadDoc>(d: &D, list: &ObjId, at: At) -> usize {
+    match at {
+        At::Now => d.length(list),
+        At::Heads(h) => d.length_at(list, h),
+    }
+}
+
+fn as_obj(v: Option<(Value<'_>, ObjId)>) -> Option<ObjId> {
+    match v {
+        Some((Value::Object(_), id)) => Some(id),
         _ => None,
     }
 }
 
-fn get_str<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> String {
-    match d.get(obj, key) {
-        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+fn as_str(v: Option<(Value<'_>, ObjId)>) -> String {
+    match v {
+        Some((Value::Scalar(s), _)) => match s.as_ref() {
             ScalarValue::Str(s) => s.to_string(),
             _ => String::new(),
         },
@@ -983,9 +1020,9 @@ fn get_str<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> String {
     }
 }
 
-fn get_i64<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> i64 {
-    match d.get(obj, key) {
-        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+fn as_i64(v: Option<(Value<'_>, ObjId)>) -> i64 {
+    match v {
+        Some((Value::Scalar(s), _)) => match s.as_ref() {
             ScalarValue::Int(i) => *i,
             ScalarValue::Uint(u) => *u as i64,
             ScalarValue::Timestamp(t) => *t,
@@ -995,16 +1032,9 @@ fn get_i64<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> i64 {
     }
 }
 
-fn get_bool<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> bool {
-    match d.get(obj, key) {
-        Ok(Some((Value::Scalar(s), _))) => matches!(s.as_ref(), ScalarValue::Boolean(true)),
-        _ => false,
-    }
-}
-
-fn get_f64<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> f64 {
-    match d.get(obj, key) {
-        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+fn as_f64(v: Option<(Value<'_>, ObjId)>) -> f64 {
+    match v {
+        Some((Value::Scalar(s), _)) => match s.as_ref() {
             ScalarValue::F64(f) => *f,
             ScalarValue::Int(i) => *i as f64,
             _ => 0.0,
@@ -1013,13 +1043,38 @@ fn get_f64<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> f64 {
     }
 }
 
+fn as_bool(v: Option<(Value<'_>, ObjId)>) -> bool {
+    matches!(v, Some((Value::Scalar(s), _)) if matches!(s.as_ref(), ScalarValue::Boolean(true)))
+}
+
+// Ergonomic live-read wrappers — every existing call site stays unchanged;
+// they're the `At::Now` case of the unified readers above.
+fn child<D: ReadDoc>(d: &D, parent: &ObjId, key: &str) -> Option<ObjId> {
+    as_obj(aget(d, parent, key, At::Now))
+}
+fn get_str<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> String {
+    as_str(aget(d, obj, key, At::Now))
+}
+fn get_i64<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> i64 {
+    as_i64(aget(d, obj, key, At::Now))
+}
+fn get_bool<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> bool {
+    as_bool(aget(d, obj, key, At::Now))
+}
+fn get_f64<D: ReadDoc>(d: &D, obj: &ObjId, key: &str) -> f64 {
+    as_f64(aget(d, obj, key, At::Now))
+}
 fn get_folder<D: ReadDoc>(d: &D, note_obj: &ObjId) -> Vec<String> {
-    let Some(list) = child(d, note_obj, "folder") else {
+    folder(d, note_obj, At::Now)
+}
+
+fn folder<D: ReadDoc>(d: &D, note_obj: &ObjId, at: At) -> Vec<String> {
+    let Some(list) = as_obj(aget(d, note_obj, "folder", at)) else {
         return Vec::new();
     };
-    (0..d.length(&list))
-        .filter_map(|i| match d.get(&list, i) {
-            Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+    (0..alen(d, &list, at))
+        .filter_map(|i| match aget(d, &list, i, at) {
+            Some((Value::Scalar(s), _)) => match s.as_ref() {
                 ScalarValue::Str(s) => Some(s.to_string()),
                 _ => None,
             },
@@ -1035,140 +1090,40 @@ fn ensure_map<T: Transactable>(tx: &mut T, key: &str) -> Result<ObjId> {
     Ok(tx.put_object(ROOT, key, ObjType::Map)?)
 }
 
-// ---- "as at heads" helpers -----------------------------------------------
-//
-// Mirror the live readers above but go through Automerge's clock-based
-// `*_at` API, so `plan_restore_to` can read a past state WITHOUT `fork_at`
-// (which panics on the upstream `MissingOps` bug). Same shapes, just with a
-// `heads` clock threaded through.
-
-fn child_at<D: ReadDoc>(d: &D, parent: &ObjId, key: &str, h: &[ChangeHash]) -> Option<ObjId> {
-    match d.get_at(parent, key, h) {
-        Ok(Some((Value::Object(_), id))) => Some(id),
-        _ => None,
-    }
-}
-
-fn str_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> String {
-    match d.get_at(obj, key, h) {
-        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
-            ScalarValue::Str(s) => s.to_string(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
-}
-
-fn i64_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> i64 {
-    match d.get_at(obj, key, h) {
-        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
-            ScalarValue::Int(i) => *i,
-            ScalarValue::Uint(u) => *u as i64,
-            ScalarValue::Timestamp(t) => *t,
-            _ => 0,
-        },
-        _ => 0,
-    }
-}
-
-fn f64_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> f64 {
-    match d.get_at(obj, key, h) {
-        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
-            ScalarValue::F64(f) => *f,
-            ScalarValue::Int(i) => *i as f64,
-            _ => 0.0,
-        },
-        _ => 0.0,
-    }
-}
-
-fn bool_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> bool {
-    match d.get_at(obj, key, h) {
-        Ok(Some((Value::Scalar(s), _))) => matches!(s.as_ref(), ScalarValue::Boolean(true)),
-        _ => false,
-    }
-}
-
-fn folder_at<D: ReadDoc>(d: &D, note_obj: &ObjId, h: &[ChangeHash]) -> Vec<String> {
-    let Some(list) = child_at(d, note_obj, "folder", h) else {
-        return Vec::new();
-    };
-    (0..d.length_at(&list, h))
-        .filter_map(|i| match d.get_at(&list, i, h) {
-            Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
-                ScalarValue::Str(s) => Some(s.to_string()),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect()
-}
-
-fn all_notes_at<D: ReadDoc>(d: &D, notes: &ObjId, h: &[ChangeHash]) -> Vec<Note> {
-    d.keys_at(notes, h)
-        .filter_map(|id| {
-            let obj = child_at(d, notes, &id, h)?;
-            Some(Note {
-                id,
-                title: str_at(d, &obj, "title", h),
-                folder: folder_at(d, &obj, h),
-                body: child_at(d, &obj, "body", h)
-                    .and_then(|b| d.text_at(&b, h).ok())
-                    .unwrap_or_default(),
-                created: i64_at(d, &obj, "created", h),
-                modified: i64_at(d, &obj, "modified", h),
-                private: bool_at(d, &obj, "private", h),
-            })
-        })
-        .collect()
-}
-
-fn all_todos_at<D: ReadDoc>(d: &D, todos: &ObjId, h: &[ChangeHash]) -> Vec<Todo> {
-    d.keys_at(todos, h)
-        .filter_map(|id| {
-            let o = child_at(d, todos, &id, h)?;
-            Some(Todo {
-                id,
-                text: str_at(d, &o, "text", h),
-                order: f64_at(d, &o, "order", h),
-                created: i64_at(d, &o, "created", h),
-            })
-        })
-        .collect()
-}
-
-/// Materialize one note (body included) from an arbitrary doc — mirrors
-/// `Store::read_note` but free, so it also works on a `fork_at` snapshot.
-fn note_from<D: ReadDoc>(d: &D, notes: &ObjId, id: &str) -> Option<Note> {
-    let obj = child(d, notes, id)?;
+/// Materialize one note (body included) — the single definition, used both
+/// for live reads (`At::Now`) and restore's at-heads reads (`At::Heads`).
+fn note_view<D: ReadDoc>(d: &D, notes: &ObjId, id: &str, at: At) -> Option<Note> {
+    let obj = as_obj(aget(d, notes, id, at))?;
     Some(Note {
         id: id.to_string(),
-        title: get_str(d, &obj, "title"),
-        folder: get_folder(d, &obj),
-        body: child(d, &obj, "body")
-            .and_then(|b| d.text(&b).ok())
+        title: as_str(aget(d, &obj, "title", at)),
+        folder: folder(d, &obj, at),
+        body: as_obj(aget(d, &obj, "body", at))
+            .map(|b| atext(d, &b, at))
             .unwrap_or_default(),
-        created: get_i64(d, &obj, "created"),
-        modified: get_i64(d, &obj, "modified"),
-        private: get_bool(d, &obj, "private"),
+        created: as_i64(aget(d, &obj, "created", at)),
+        modified: as_i64(aget(d, &obj, "modified", at)),
+        private: as_bool(aget(d, &obj, "private", at)),
     })
 }
 
-fn all_notes<D: ReadDoc>(d: &D, notes: &ObjId) -> Vec<Note> {
-    d.keys(notes)
-        .filter_map(|id| note_from(d, notes, &id))
+fn all_notes<D: ReadDoc>(d: &D, notes: &ObjId, at: At) -> Vec<Note> {
+    akeys(d, notes, at)
+        .into_iter()
+        .filter_map(|id| note_view(d, notes, &id, at))
         .collect()
 }
 
-fn all_todos<D: ReadDoc>(d: &D, todos: &ObjId) -> Vec<Todo> {
-    d.keys(todos)
+fn all_todos<D: ReadDoc>(d: &D, todos: &ObjId, at: At) -> Vec<Todo> {
+    akeys(d, todos, at)
+        .into_iter()
         .filter_map(|id| {
-            let o = child(d, todos, &id)?;
+            let o = as_obj(aget(d, todos, &id, at))?;
             Some(Todo {
-                id: id.clone(),
-                text: get_str(d, &o, "text"),
-                order: get_f64(d, &o, "order"),
-                created: get_i64(d, &o, "created"),
+                id,
+                text: as_str(aget(d, &o, "text", at)),
+                order: as_f64(aget(d, &o, "order", at)),
+                created: as_i64(aget(d, &o, "created", at)),
             })
         })
         .collect()

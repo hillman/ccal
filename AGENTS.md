@@ -153,11 +153,14 @@ has holes (normal once history has merged via sync). It's an upstream panic
 present *unchanged in 0.7.4 → 0.9.0* (not a version bug; upgrading doesn't
 fix it). Therefore: `Store::history()` uses `get_changes_meta(&[])`
 (change-graph metadata only, no op reconstruction) and `plan_restore_to`
-reads past state with the clock-based `*_at` ReadDoc API (`keys_at`,
-`get_at`, `text_at`, `length_at` — the `*_at` free helpers) instead of
-forking. `plan_restore_to` also validates every target head via
-`get_change_meta_by_hash` first: unknown heads would make every `*_at` read
-empty and a restore would then wipe the corpus. Keep it this way.
+reads past state with the clock-based `*_at` ReadDoc API instead of
+forking. All free readers take one `At` clock param (`At::Now` →
+`d.get`/`keys`/`text`; `At::Heads(h)` → `d.get_at`/`keys_at`/`text_at`):
+one `note_view`/`all_notes`/`all_todos`/`folder` definition serves both
+live reads and restore, so a new note field can't be added to one path and
+forgotten on the other. `plan_restore_to` also validates every target head
+via `get_change_meta_by_hash` first: unknown heads would make every `*_at`
+read empty and a restore would then wipe the corpus. Keep it this way.
 
 UI stack: **ratatui 0.30** + **edtui 0.11** (Vim editor, syntect markdown
 highlighting). crossterm is **not a direct dependency** — always import it

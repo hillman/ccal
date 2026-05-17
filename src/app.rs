@@ -124,9 +124,13 @@ impl App {
 
     /// Brief lock on the shared store. Every call site takes it for one
     /// store operation and drops it on the same statement — the sync thread
-    /// must never wait behind the UI.
+    /// must never wait behind the UI. Poison is *recovered* rather than
+    /// re-panicked: if the sync thread ever died mid-operation we still
+    /// want the UI usable (the doc is an Automerge value; a half-applied
+    /// transaction is impossible — commits are atomic), and one fault
+    /// shouldn't cascade into a second panic here.
     fn st(&self) -> MutexGuard<'_, Store> {
-        self.store.lock().expect("store mutex poisoned")
+        self.store.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn persist(&mut self) {
