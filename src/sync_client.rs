@@ -19,7 +19,7 @@
 //! still sent and checked so network-trust isn't the *only* gate.
 
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -27,6 +27,7 @@ use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{Error as WsError, Message};
 
+use ccal::models::now_ms;
 use ccal::{Store, SyncState};
 
 /// Shared handle the UI polls each tick.
@@ -37,6 +38,13 @@ pub struct Handle {
     /// One-line connection state for the status bar ("Synced", "Sync:
     /// offline, retrying…", …).
     pub status: Arc<Mutex<String>>,
+    /// Epoch-ms of the last successful sync exchange (a protocol message
+    /// sent or received). `0` = never synced since launch. The UI renders
+    /// this as a persistent "synced Ns ago" indicator.
+    pub last_sync: Arc<AtomicI64>,
+    /// `true` while a socket is up and the handshake succeeded; `false`
+    /// whenever the thread is offline / reconnecting.
+    pub connected: Arc<AtomicBool>,
 }
 
 const POLL_IDLE: Duration = Duration::from_millis(100);
@@ -47,14 +55,25 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub fn spawn(store: Arc<Mutex<Store>>, url: String, token: String) -> Handle {
     let dirty = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new("Sync: connecting…".to_string()));
-    let handle = Handle { dirty: dirty.clone(), status: status.clone() };
+    let last_sync = Arc::new(AtomicI64::new(0));
+    let connected = Arc::new(AtomicBool::new(false));
+    let handle = Handle {
+        dirty: dirty.clone(),
+        status: status.clone(),
+        last_sync: last_sync.clone(),
+        connected: connected.clone(),
+    };
 
     thread::Builder::new()
         .name("ccal-sync".into())
         .spawn(move || {
             let mut backoff = BACKOFF_START;
             loop {
-                match session(&store, &url, &token, &dirty, &status) {
+                let r = session(
+                    &store, &url, &token, &dirty, &status, &last_sync, &connected,
+                );
+                connected.store(false, Ordering::SeqCst);
+                match r {
                     // Clean close (server restart, etc.) — reconnect fast.
                     Ok(()) => {
                         backoff = BACKOFF_START;
@@ -82,12 +101,15 @@ fn set(status: &Arc<Mutex<String>>, msg: &str) {
 
 /// One connection attempt: handshake, then pump until the socket or a
 /// protocol step errors. Returns `Ok` on a clean close.
+#[allow(clippy::too_many_arguments)]
 fn session(
     store: &Arc<Mutex<Store>>,
     url: &str,
     token: &str,
     dirty: &Arc<AtomicBool>,
     status: &Arc<Mutex<String>>,
+    last_sync: &Arc<AtomicI64>,
+    connected: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut req = url
         .into_client_request()
@@ -113,6 +135,7 @@ fn session(
 
     let mut state = SyncState::new();
     set(status, "Sync: connected");
+    connected.store(true, Ordering::SeqCst);
 
     loop {
         // 1. Push everything the protocol currently owes the server.
@@ -122,7 +145,10 @@ fn session(
                 st.generate_sync_message(&mut state)
             };
             match next {
-                Some(bytes) => write(&mut ws, Message::Binary(bytes))?,
+                Some(bytes) => {
+                    write(&mut ws, Message::Binary(bytes))?;
+                    last_sync.store(now_ms(), Ordering::SeqCst);
+                }
                 None => break,
             }
         }
@@ -135,6 +161,7 @@ fn session(
         // 2. Drain whatever the server has for us right now.
         match ws.read() {
             Ok(Message::Binary(bytes)) => {
+                last_sync.store(now_ms(), Ordering::SeqCst);
                 let changed = {
                     let mut st = store.lock().unwrap();
                     st.receive_sync_message(&mut state, &bytes)

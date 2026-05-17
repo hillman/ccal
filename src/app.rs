@@ -9,7 +9,7 @@ use anyhow::Result;
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use ccal::models::{NoteMeta, Todo};
+use ccal::models::{now_ms, NoteMeta, Todo};
 use ccal::store::Store;
 
 use crate::sync_client;
@@ -146,6 +146,30 @@ impl App {
         } else if remote_changed && !editing {
             self.status = "Synced".into();
         }
+    }
+
+    /// Persistent header indicator, independent of the transient status
+    /// line: connection dot + how long ago we last exchanged with the peer.
+    /// `None` in standalone mode (no sync configured) so the header stays
+    /// clean.
+    pub fn sync_indicator(&self) -> Option<String> {
+        let sync = self.sync.as_ref()?;
+        let connected = sync.connected.load(Ordering::SeqCst);
+        let last = sync.last_sync.load(Ordering::SeqCst);
+        let when = if last == 0 {
+            "never".to_string()
+        } else {
+            ago(now_ms() - last)
+        };
+        Some(if connected {
+            if last == 0 {
+                "● online · handshaking…".to_string()
+            } else {
+                format!("● online · synced {when}")
+            }
+        } else {
+            format!("○ offline · synced {when}")
+        })
     }
 
     fn refresh(&mut self) {
@@ -549,6 +573,22 @@ fn parse_path(s: &str) -> Vec<String> {
         .filter(|c| !c.is_empty())
         .map(|c| c.to_string())
         .collect()
+}
+
+/// Coarse human "N ago" for a millisecond duration (negative clamps to 0).
+fn ago(ms: i64) -> String {
+    let s = (ms / 1000).max(0);
+    if s < 5 {
+        "just now".to_string()
+    } else if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86_400)
+    }
 }
 
 fn make_editor(content: &str) -> EditorState {

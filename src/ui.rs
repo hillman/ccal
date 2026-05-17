@@ -62,11 +62,13 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(" Notes ", if app.tab == Tab::Notes { sel } else { unsel }),
     ];
-    f.render_widget(
-        Paragraph::new(Line::from(spans))
-            .block(Block::default().borders(Borders::ALL).title(" ccal ")),
-        area,
-    );
+    let mut block = Block::default().borders(Borders::ALL).title(" ccal ");
+    if let Some(s) = app.sync_indicator() {
+        let online = s.starts_with('●');
+        let style = Style::default().fg(if online { Color::Green } else { Color::DarkGray });
+        block = block.title_top(Line::from(Span::styled(format!(" {s} "), style)).right_aligned());
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
 fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
