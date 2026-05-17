@@ -18,6 +18,7 @@ use crate::sync_client;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Tab {
+    Dashboard,
     Todos,
     Notes,
     Calendar,
@@ -95,6 +96,12 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
 
+    /// The five most-recently-edited notes shown on the Dashboard's left
+    /// pane. Kept in sync by `refresh` (so a remote/local edit reorders it)
+    /// — body-free; opening one routes through `open_note_by_id`.
+    pub dash_notes: Vec<NoteMeta>,
+    pub dash_sel: usize,
+
     pub todos: Vec<Todo>,
     pub todo_sel: usize,
 
@@ -157,11 +164,13 @@ impl App {
             store,
             sync,
             last_sync: String::new(),
-            tab: Tab::Todos,
+            tab: Tab::Dashboard,
             mode: Mode::Normal,
             pending: None,
             should_quit: false,
-            status: "Tab: switch · q: quit".into(),
+            status: "Dashboard — ↑↓ recent notes · Enter open · Tab/1-5 switch · q quit".into(),
+            dash_notes: Vec::new(),
+            dash_sel: 0,
             todos: Vec::new(),
             todo_sel: 0,
             cur: Vec::new(),
@@ -290,9 +299,27 @@ impl App {
             self.history = h;
         }
         { let subs = self.st().calendars(); self.cal_subs = subs; }
+        self.refresh_dashboard();
         self.entries = self.build_entries();
         self.clamp();
         self.update_preview();
+    }
+
+    /// Recompute the Dashboard's "recent notes" pane: the five notes with
+    /// the newest `modified`, body-free. Cheap (one `note_metas` scan) and
+    /// safe to call from `refresh` so the list tracks every edit.
+    fn refresh_dashboard(&mut self) {
+        let mut metas = self.st().note_metas();
+        metas.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.title.cmp(&b.title)));
+        metas.truncate(5);
+        self.dash_notes = metas;
+    }
+
+    fn enter_dashboard(&mut self) {
+        self.refresh_dashboard();
+        self.dash_sel = 0;
+        self.status =
+            "Dashboard — ↑↓ recent notes · Enter open · Tab/1-5 switch".into();
     }
 
     /// Reload the document from disk (picks up an external `import-bear`).
@@ -425,6 +452,9 @@ impl App {
     }
 
     fn clamp(&mut self) {
+        if self.dash_sel >= self.dash_notes.len() {
+            self.dash_sel = self.dash_notes.len().saturating_sub(1);
+        }
         if self.todo_sel >= self.todos.len() {
             self.todo_sel = self.todos.len().saturating_sub(1);
         }
@@ -472,24 +502,28 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => {
                 let fwd = key.code == KeyCode::Tab;
                 let next = match (self.tab, fwd) {
+                    (Tab::Dashboard, true) => Tab::Todos,
                     (Tab::Todos, true) => Tab::Notes,
                     (Tab::Notes, true) => Tab::Calendar,
                     (Tab::Calendar, true) => Tab::History,
-                    (Tab::History, true) => Tab::Todos,
-                    (Tab::Todos, false) => Tab::History,
+                    (Tab::History, true) => Tab::Dashboard,
+                    (Tab::Dashboard, false) => Tab::History,
+                    (Tab::Todos, false) => Tab::Dashboard,
                     (Tab::Notes, false) => Tab::Todos,
                     (Tab::Calendar, false) => Tab::Notes,
                     (Tab::History, false) => Tab::Calendar,
                 };
                 self.goto_tab(next);
             }
-            KeyCode::Char('1') => self.goto_tab(Tab::Todos),
-            KeyCode::Char('2') => self.goto_tab(Tab::Notes),
-            KeyCode::Char('3') => self.goto_tab(Tab::Calendar),
-            KeyCode::Char('4') => self.goto_tab(Tab::History),
+            KeyCode::Char('1') => self.goto_tab(Tab::Dashboard),
+            KeyCode::Char('2') => self.goto_tab(Tab::Todos),
+            KeyCode::Char('3') => self.goto_tab(Tab::Notes),
+            KeyCode::Char('4') => self.goto_tab(Tab::Calendar),
+            KeyCode::Char('5') => self.goto_tab(Tab::History),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             _ => match self.tab {
+                Tab::Dashboard => self.dashboard_key(key)?,
                 Tab::Todos => self.todos_key(key)?,
                 Tab::Notes => self.notes_key(key)?,
                 Tab::Calendar => self.cal_key(key)?,
@@ -505,6 +539,8 @@ impl App {
             self.enter_history();
         } else if self.tab == Tab::Calendar {
             self.enter_calendar();
+        } else if self.tab == Tab::Dashboard {
+            self.enter_dashboard();
         }
     }
 
@@ -595,6 +631,7 @@ impl App {
     fn move_sel(&mut self, delta: isize) {
         let rows = self.note_rows();
         let (sel, len) = match self.tab {
+            Tab::Dashboard => (&mut self.dash_sel, self.dash_notes.len()),
             Tab::Todos => (&mut self.todo_sel, self.todos.len()),
             Tab::Notes => (&mut self.entry_sel, rows),
             Tab::Calendar => (
@@ -607,6 +644,20 @@ impl App {
             return;
         }
         *sel = ((*sel as isize + delta).rem_euclid(len as isize)) as usize;
+    }
+
+    /// Dashboard is read-only except for the recent-notes pane: Enter/→
+    /// opens the selected note exactly as the Notes tab would (switch tab,
+    /// descend to its folder, open the editor) via `open_note_by_id`.
+    fn dashboard_key(&mut self, key: KeyEvent) -> Result<()> {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Right) {
+            if let Some(m) = self.dash_notes.get(self.dash_sel).cloned() {
+                if !self.open_note_by_id(&m.id) {
+                    self.status = "That note no longer exists".into();
+                }
+            }
+        }
+        Ok(())
     }
 
     fn todos_key(&mut self, key: KeyEvent) -> Result<()> {

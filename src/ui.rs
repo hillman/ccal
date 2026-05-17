@@ -49,6 +49,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             f.render_widget(view, chunks[1]);
         }
         _ => match app.tab {
+            Tab::Dashboard => draw_dashboard(f, app, chunks[1]),
             Tab::Todos => draw_todos(f, app, chunks[1]),
             Tab::Notes => draw_notes(f, app, chunks[1]),
             Tab::Calendar => draw_calendar(f, app, chunks[1]),
@@ -62,13 +63,15 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let sel = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
     let unsel = Style::default().fg(Color::Cyan);
     let spans = vec![
-        Span::styled(" [1] Todos ", if app.tab == Tab::Todos { sel } else { unsel }),
+        Span::styled(" [1] Dashboard ", if app.tab == Tab::Dashboard { sel } else { unsel }),
         Span::raw("  "),
-        Span::styled(" [2] Notes ", if app.tab == Tab::Notes { sel } else { unsel }),
+        Span::styled(" [2] Todos ", if app.tab == Tab::Todos { sel } else { unsel }),
         Span::raw("  "),
-        Span::styled(" [3] Calendar ", if app.tab == Tab::Calendar { sel } else { unsel }),
+        Span::styled(" [3] Notes ", if app.tab == Tab::Notes { sel } else { unsel }),
         Span::raw("  "),
-        Span::styled(" [4] History ", if app.tab == Tab::History { sel } else { unsel }),
+        Span::styled(" [4] Calendar ", if app.tab == Tab::Calendar { sel } else { unsel }),
+        Span::raw("  "),
+        Span::styled(" [5] History ", if app.tab == Tab::History { sel } else { unsel }),
     ];
     let mut block = Block::default().borders(Borders::ALL).title(" ccal ");
     if let Some(s) = app.sync_indicator() {
@@ -77,6 +80,130 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         block = block.title_top(Line::from(Span::styled(format!(" {s} "), style)).right_aligned());
     }
     f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+/// Position-0 overview. Left half: the five most-recently-edited notes
+/// (the only interactive pane — ↑↓ select, Enter opens it in the Notes
+/// editor). Right half: top todos over today's agenda, both read-only and
+/// reusing the same `app.todos` / `app.cal_occ` the dedicated tabs render.
+fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Left: recent notes (full height, selectable).
+    let note_items: Vec<ListItem> = if app.dash_notes.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  No notes yet",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.dash_notes
+            .iter()
+            .map(|m| {
+                let title = if m.title.is_empty() { "(untitled)" } else { &m.title };
+                let where_ = if m.folder.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", m.folder.join("/"))
+                };
+                let icon = if m.private { "🔒" } else { "📄" };
+                let line = Line::from(vec![
+                    Span::raw(format!("  {icon} ")),
+                    Span::styled(
+                        title.to_string(),
+                        if m.private {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::styled(
+                        format!("  ⟨{where_}⟩"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect()
+    };
+    let notes = List::new(note_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Recent notes  (↑↓ select · Enter open) "),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    let mut nstate = ListState::default();
+    if !app.dash_notes.is_empty() {
+        nstate.select(Some(app.dash_sel));
+    }
+    f.render_stateful_widget(notes, halves[0], &mut nstate);
+
+    // Right: todos over today's agenda, half height each.
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(halves[1]);
+
+    let todo_items: Vec<ListItem> = if app.todos.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  Nothing to do",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.todos
+            .iter()
+            .take(5)
+            .map(|t| ListItem::new(format!("• {}", t.text)))
+            .collect()
+    };
+    f.render_widget(
+        List::new(todo_items)
+            .block(Block::default().borders(Borders::ALL).title(" Top todos ")),
+        right[0],
+    );
+
+    let today = Local::now().date_naive();
+    let line = |o: &ccal::calendar::Occurrence| -> String {
+        let s = o.start.with_timezone(&Local);
+        if o.all_day {
+            format!("  • all day   {}", o.summary)
+        } else {
+            let e = o.end.with_timezone(&Local);
+            format!("  {}–{}  {}", s.format("%H:%M"), e.format("%H:%M"), o.summary)
+        }
+    };
+    let mut cal_items: Vec<ListItem> = Vec::new();
+    for (label, day) in [
+        ("Today", today),
+        ("Tomorrow", today + chrono::Duration::days(1)),
+    ] {
+        cal_items.push(ListItem::new(Span::styled(
+            format!("{label} — {}", day.format("%a %-d %b")),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+        let mut hits = 0;
+        for o in &app.cal_occ {
+            if o.start.with_timezone(&Local).date_naive() == day {
+                cal_items.push(ListItem::new(line(o)));
+                hits += 1;
+            }
+        }
+        if hits == 0 {
+            cal_items.push(ListItem::new(Span::styled(
+                "  (nothing scheduled)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    f.render_widget(
+        List::new(cal_items)
+            .block(Block::default().borders(Borders::ALL).title(" Agenda ")),
+        right[1],
+    );
 }
 
 fn draw_todos(f: &mut Frame, app: &App, area: Rect) {

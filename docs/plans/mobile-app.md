@@ -14,10 +14,21 @@ In scope:
 - View todos (list).
 - Add a todo.
 
-Out of scope (v1, and probably forever): note editing, folder management,
+Out of scope (v1, and probably forever): folder management,
 todo reordering/completion, calendar, the LLM features, settings beyond the
 sync endpoint, Android (the codebase stays cross-platform-capable but only
 iOS is built and tested).
+
+**Scope change 2026-05-17 — note *body* editing is now IN.** Originally
+listed out of scope. Reversed deliberately: `Store::set_note_body` already
+splices at character granularity, so an edit from the phone CRDT-merges
+with a concurrent TUI edit exactly as the TUI's own editing does — the
+objection was product surface, not safety, and the capture-and-glance app
+is more useful if a glanced note can be corrected in place. The durability
+rule is **extended to edits** (set_note_body → save() synchronously before
+the UI leaves the editor). Still out: title/folder editing, and any rich
+editor — it is a plain `textarea` (no vim/edtui; that stays a TUI concern).
+Note bodies are also now markdown-*rendered* in the read view (see Screens).
 
 ## Decisions
 
@@ -189,8 +200,13 @@ acceptable (durability covers it).
 
 ## Screens (v1)
 
-1. **Notes list** — `note_metas()` grouped by folder. Tap → note view.
-2. **Note view** — read-only render of `note(id).body`. No editor.
+1. **Notes list** — folder drill-down, ordering byte-identical to the TUI
+   (`children_of`: subfolders case-insensitive, then notes `modified` desc,
+   ties by title). Tap folder → descend, tap note → note view.
+2. **Note view** — `note(id).body` **markdown-rendered** (dioxus-markdown,
+   git-pinned: crates.io 0.0.1 is Dioxus-0.6 and unusable on our 0.7).
+   An **Edit** action opens a plain-`textarea` body editor; Save runs
+   `set_note_body` → `save()` synchronously (durability rule) then refreshes.
 3. **New note** — title + body fields → `create_note` then `set_note_body`.
    A plain `textarea`; no vim, no edtui (that's a TUI concern).
 4. **Todos** — `todos()` list (read-only display).

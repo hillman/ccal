@@ -1,7 +1,9 @@
 # Live notes plan — file replicas & server-fetched URL notes
 
 Status: planned. Decisions made 2026-05-17 (URL→text pipeline verified with a
-throwaway prototype against live pages — see "Pipeline, proven").
+throwaway prototype against live pages — see "Pipeline, proven"). Decision #2
+revised 2026-05-17: a URL note's body is **not** in the synced doc — server
+cache + side-band push (see "URL body: out of the doc").
 
 ## Goal & scope
 
@@ -14,13 +16,15 @@ Two ways a note's content can be *driven from outside the doc*, from
    web resource (news, a webhook's markdown, an article), refreshed in the
    background by `ccal-server`.
 
-The two halves deliberately have **opposite sync models**, and that is the
-whole design, not an accident:
+Both halves share **one principle**: only the small user-authored `source`
+pointer ever enters the Automerge doc; the body is *derived content* and
+never syncs. This is the established `cal_sync` philosophy applied
+uniformly, and it is what keeps refresh churn out of document history:
 
-| | Pointer (path / url) | Body |
-|---|---|---|
-| **File note** | syncs | **not synced** — the filesystem *is* the store |
-| **URL note** | syncs | **syncs** — `ccal-server` is the sole writer |
+| | Pointer (path / url) | Body | Body store |
+|---|---|---|---|
+| **File note** | syncs | **not synced** | the local filesystem *is* the store |
+| **URL note** | syncs | **not synced** | a `ccal-server`-side cache, pushed to clients side-band |
 
 ## Decisions
 
@@ -39,24 +43,38 @@ whole design, not an accident:
   philosophy (only the small user-authored thing syncs; derived content is
   local).
 
-- **URL note: `ccal-server` is the single writer.** A per-doc background
-  task on the server fetches on an interval and writes the body. Server-only
-  because: it is always-on, it is a single well-known writer (no
-  multi-device race to splice one body — the exact hazard the calendar
-  design avoids), and it can write while no TUI is open. It rides the
-  existing change-broadcast, so a refreshed note appears live in every TUI
-  and over MCP (same mechanism the embedded MCP server already uses). If no
-  server runs, URL notes simply do not refresh — consistent with the file
-  case ("just use what's there").
+- **URL note: `ccal-server` is the single fetcher; the body never enters
+  the doc.** A per-doc background task on the server fetches on an interval.
+  Server-only because: it is always-on, it is a single well-known fetcher
+  (no multi-device race, polite to rate limits), and it works while no TUI
+  is open — the rationale that ruled out a per-client fetch. The rendered
+  body is written to a **server-side cache** (in memory, persisted to
+  `<data_dir>/<docid>.live/<noteid>` so it survives a restart), *not* to
+  the Automerge document. Refreshes therefore generate **zero** document
+  history — the failure mode that an in-doc body cannot escape (a genuinely
+  live page legitimately changes every cycle, so a diff-and-skip guard does
+  not save it; per-object history truncation is impossible in Automerge,
+  and global compaction would destroy the History/checkpoint time-travel
+  feature). If no server runs, URL notes simply do not refresh — consistent
+  with the file case ("just use what's there").
 
-- **Body is spliced only when it actually changed.** A diff-and-skip guard:
-  if the freshly rendered text equals the current body, the transaction is
-  not opened at all. Without this, a 15-minute refresh loop bloats document
-  history forever — the precise failure mode the `cal_sync` module comment
-  and `automerge-store-design` memory warn about. Fetch status / last-ok /
-  errors are **never** written to the doc; they live in an in-memory handle
-  (a `LiveStatus`, shaped like `cal_sync::CalStatus`) surfaced in a manager
-  view, same as calendars.
+- **The body reaches clients side-band, not as a doc change.** A new
+  non-doc message on the existing sync websocket carries
+  `(note_id, rendered_body, fetched_at)`; the server pushes it on connect
+  (current cache) and whenever a fetch produces new bytes. Clients hold a
+  local `live_bodies` cache keyed by note id and render a URL note from it;
+  MCP `get_note` reads the same server cache. This reuses the
+  change-broadcast *transport* (same plumbing the embedded MCP server
+  rides) without putting anything in the CRDT. A client that has never
+  received a body shows the file-note-style placeholder. Fetch status /
+  last-ok / errors are **never** persisted; they live in an in-memory
+  handle (a `LiveStatus`, shaped like `cal_sync::CalStatus`) surfaced in a
+  manager view, same as calendars.
+
+- **Diff-and-skip is still applied — now as a wire/notify guard.** If the
+  freshly rendered text equals the cached body, no side-band push is sent
+  and no client redraw is triggered. Cheap, and it keeps idle URL notes
+  silent on the socket.
 
 - **Fetch errors keep the last good body.** On 404 / 5xx / DNS / timeout the
   existing body is left untouched; the error shows only in the in-memory
@@ -127,9 +145,9 @@ pub source: Option<Source>,
 
 Stored as a small static sub-map on the note (`note.<id>.source`), written
 once at create / on edit, never per-refresh — so it cannot bloat history.
-For a **file** note the note's `body` Text object is left empty (or absent);
-the body never goes in the doc. For a **URL** note the `body` Text object is
-the synced rendered content.
+For **both** file and URL notes the note's `body` Text object is left empty
+(or absent); a live body never goes in the doc. A file note's body is the
+file on disk; a URL note's body is the server cache delivered side-band.
 
 No genesis change is needed: a `source` sub-map is created by exactly one
 replica under an already-unique note id — same no-concurrent-seed argument
@@ -140,13 +158,17 @@ as `cal/<id>` and `mark/<char>`.
 - `set_note_source(id, Source)` / `clear_note_source(id)` — static pointer
   writes, ride sync like `set_note_folder`.
 - `live_notes() -> Vec<(id, Source)>` — for the fetch loop and the manager.
-- `refresh_note_body(id, &str)` — **guarded**: reads the current body,
-  returns early without opening a transaction if it equals the new text;
-  otherwise splices. The single safe write path for machine-driven bodies.
+- **No `refresh_note_body` doc write.** A URL body never touches the
+  Automerge doc, so there is no guarded-splice path. Instead the server
+  owns a `LiveCache` (`note_id -> { body, fetched_at }`, in memory +
+  `<data_dir>/<docid>.live/`); `cache.put(id, &str)` returns whether the
+  bytes changed (the diff-and-skip guard) and, when changed, the server
+  emits the side-band push.
 - `note` / `note_metas` carry `source` so the tree can mark live notes and
   MCP can flag them.
 - MCP boundary (`server_mcp.rs`): `update_note_body` refused when
-  `source.is_some()`, reusing the private-note refusal shape.
+  `source.is_some()`, reusing the private-note refusal shape; `get_note`
+  for a URL note returns the `LiveCache` body, not the (empty) doc body.
 
 ## File replica (TUI side)
 
@@ -176,13 +198,43 @@ released, `catch_unwind` around parsing, status published in memory):
   the async side; the lib stays tokio-free — the fetch+convert helpers are
   sync and run via `spawn_blocking`).
 - Each cycle: `store.live_notes()` filtered to `Url`; for each, fetch with
-  `ureq`, run the pipeline, call `refresh_note_body` (guarded), then
-  `save`. The existing debounced saver + change-broadcast publish it live.
-- Errors → in-memory `LiveStatus` + server log; body untouched.
+  `ureq`, run the pipeline, `LiveCache::put`. If the bytes changed, push
+  the side-band `(note_id, body, fetched_at)` message to connected clients
+  (and invalidate the MCP read). No `store.save()`, no doc change, no sync
+  message — the document is untouched.
+- Errors → in-memory `LiveStatus` + server log; cached body untouched.
 - Interval: `config.rs` gains `live_refresh_secs()`
   (`$CCAL_LIVE_REFRESH` > `[server] live_refresh_secs` > 900, floored),
   copying `calendar_refresh_secs()` verbatim; per-note `refresh_secs`
   overrides when non-zero.
+
+## URL body: out of the doc (side-band channel)
+
+The one new piece of protocol. The sync websocket currently carries only
+Automerge sync messages; add a framed non-doc variant:
+
+```
+LiveBody { note_id: String, body: String, fetched_at: i64 }
+```
+
+- **Server → client, on connect:** after the initial Automerge sync, the
+  server walks its `LiveCache` and sends one `LiveBody` per URL note the
+  client can see. A fresh client is immediately whole.
+- **Server → client, on change:** when a fetch cycle's `LiveCache::put`
+  reports changed bytes, broadcast one `LiveBody`. Unchanged → nothing on
+  the wire (the diff-and-skip guard, now a notify guard).
+- **Client:** a `live_bodies: HashMap<NoteId, LiveCacheEntry>` beside the
+  `Store`. A URL note renders from it; a miss renders the placeholder
+  *"live url — not fetched yet"*. Never written back, never synced.
+- **Persistence:** `<data_dir>/<docid>.live/<noteid>` on the server so a
+  restart does not blank every URL note until the next cycle. The client
+  cache is purely in-memory (rehydrated from the on-connect replay).
+- **MCP:** `get_note` / `get_notes` for a URL note read `LiveCache`, not
+  the empty doc body, so an assistant sees what a human sees.
+
+This deliberately mirrors `cal_sync`'s "subscription syncs, fetched data is
+a local cache" split, extended with a push so the *server* remains the sole
+fetcher (the property a pure calendar-style per-client fetch would lose).
 
 ## TUI surface
 
@@ -205,7 +257,10 @@ fetch path). `ureq` is already a dependency.
   read / on-save write + mtime warn, placeholder for missing file, manager
   view, tree marker, MCP refusal. No network, no HTML — the small one.
 - **P2 — URL notes.** `live_url.rs` server task, the verified pipeline,
-  guarded splice, in-memory status, config interval, `format` override.
+  `LiveCache` (in memory + `<data_dir>/<docid>.live/`), the `LiveBody`
+  side-band message (on-connect replay + on-change push), client
+  `live_bodies` cache + placeholder, MCP cache read, in-memory status,
+  config interval, `format` override. **No doc write path.**
 - **P3 — deferred.** Structured extraction (HN titles-only via `scraper` +
   per-source selector), webhook push endpoint, manual refresh plumbed
   TUI→server, two-way *file* beyond the v1 mtime-warn (richer merge UI).
