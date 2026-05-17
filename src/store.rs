@@ -19,7 +19,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use automerge::sync::{Message as AmSyncMessage, SyncDoc};
-use automerge::transaction::{CommitOptions, Transactable};
+use automerge::transaction::{CommitOptions, Transactable, Transaction};
 use automerge::{ActorId, Automerge, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT};
 use std::path::{Path, PathBuf};
 
@@ -32,10 +32,25 @@ use automerge::ChangeHash;
 use std::str::FromStr;
 
 use crate::models::{
-    new_id, now_ms, Checkpoint, Note, NoteInput, NoteMeta, RestoreReport, Todo,
+    new_id, now_ms, Checkpoint, HistoryRow, Note, NoteInput, NoteMeta, RestoreReport, Todo,
 };
 
 const SCHEMA: i64 = 1;
+
+/// Wall-clock seconds — Automerge change timestamps are unix *seconds*.
+fn now_secs() -> i64 {
+    now_ms() / 1000
+}
+
+/// Commit an interactive transaction, stamping it with the current time so
+/// the History view has a real timeline. The timestamp is purely advisory
+/// (Automerge does not use it in conflict resolution), so this does NOT
+/// affect convergence. NOTE: `genesis_doc` deliberately commits with
+/// `with_time(0)` instead — its change must stay byte-identical across
+/// replicas, so it must never use this.
+fn commit(tx: Transaction<'_>) {
+    tx.commit_with(CommitOptions::default().with_time(now_secs()));
+}
 
 pub struct Store {
     doc: Automerge,
@@ -126,7 +141,7 @@ impl Store {
         }
         let notes = ensure_map(&mut tx, "notes")?;
         let todos = ensure_map(&mut tx, "todos")?;
-        tx.commit();
+        commit(tx);
 
         // Resolve `checkpoints` ONLY if a prior checkpoint already created
         // it — never create it here. Creating on open would emit a
@@ -299,7 +314,7 @@ impl Store {
         for (i, c) in folder.iter().enumerate() {
             tx.insert(&list, i, c.as_str())?;
         }
-        tx.commit();
+        commit(tx);
         Ok(id)
     }
 
@@ -327,7 +342,7 @@ impl Store {
             }
             progress(idx + 1);
         }
-        tx.commit();
+        commit(tx);
         Ok(items.len())
     }
 
@@ -336,7 +351,7 @@ impl Store {
         let mut tx = self.doc.transaction();
         tx.put(&obj, "title", title)?;
         tx.put(&obj, "modified", now_ms())?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
@@ -349,7 +364,7 @@ impl Store {
         let mut tx = self.doc.transaction();
         tx.put(&obj, "private", private)?;
         tx.put(&obj, "modified", now_ms())?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
@@ -361,7 +376,7 @@ impl Store {
             tx.insert(&list, i, c.as_str())?;
         }
         tx.put(&obj, "modified", now_ms())?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
@@ -379,7 +394,7 @@ impl Store {
         let mut tx = self.doc.transaction();
         tx.splice_text(&body, p, del as isize, &ins)?;
         tx.put(&obj, "modified", now_ms())?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
@@ -424,14 +439,14 @@ impl Store {
             }
             tx.put(&obj, "modified", ts)?;
         }
-        tx.commit();
+        commit(tx);
         Ok(updates.len())
     }
 
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
         let mut tx = self.doc.transaction();
         tx.delete(&self.notes, id)?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
@@ -468,7 +483,7 @@ impl Store {
         tx.put(&obj, "text", text)?;
         tx.put(&obj, "order", next)?;
         tx.put(&obj, "created", now_ms())?;
-        tx.commit();
+        commit(tx);
         Ok(id)
     }
 
@@ -476,7 +491,7 @@ impl Store {
         let obj = child(&self.doc, &self.todos, id).ok_or_else(|| anyhow!("no such todo"))?;
         let mut tx = self.doc.transaction();
         tx.put(&obj, "text", text)?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
@@ -489,14 +504,14 @@ impl Store {
         let mut tx = self.doc.transaction();
         tx.put(&oa, "order", vb)?;
         tx.put(&ob, "order", va)?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
     pub fn delete_todo(&mut self, id: &str) -> Result<()> {
         let mut tx = self.doc.transaction();
         tx.delete(&self.todos, id)?;
-        tx.commit();
+        commit(tx);
         Ok(())
     }
 
@@ -524,7 +539,7 @@ impl Store {
         }
         let mut tx = self.doc.transaction();
         let id = tx.put_object(ROOT, "checkpoints", ObjType::Map)?;
-        tx.commit();
+        commit(tx);
         self.checkpoints = Some(id.clone());
         Ok(id)
     }
@@ -546,7 +561,7 @@ impl Store {
         for (i, h) in heads.iter().enumerate() {
             tx.insert(&hl, i, h.to_string().as_str())?;
         }
-        tx.commit();
+        commit(tx);
         Ok(id)
     }
 
@@ -593,17 +608,22 @@ impl Store {
         Ok(hs)
     }
 
-    /// Diff the checkpoint's state against the live corpus. Shared by
-    /// `preview_restore` (report only) and `restore_checkpoint` (applies).
     fn plan_restore(&self, id: &str) -> Result<RestorePlan> {
         let heads = self.checkpoint_heads(id)?;
+        self.plan_restore_to(&heads)
+    }
+
+    /// Diff the document state *at `heads`* against the live corpus. Shared
+    /// by checkpoint restore and arbitrary-point ("time-travel") restore;
+    /// `preview_*` use the report, `restore_*` apply the plan.
+    fn plan_restore_to(&self, heads: &[ChangeHash]) -> Result<RestorePlan> {
         // `fork_at` materializes the document exactly as it was at those
         // heads (history is never pruned, so the hashes are always
         // reachable once synced). Read-only — we never mutate the fork.
         let snap = self
             .doc
-            .fork_at(&heads)
-            .context("forking document at checkpoint heads")?;
+            .fork_at(heads)
+            .context("forking document at the target heads")?;
         let target_notes = obj_at(&snap, "notes")
             .map(|o| all_notes(&snap, &o))
             .unwrap_or_default();
@@ -688,12 +708,33 @@ impl Store {
         Ok(self.plan_restore(id)?.report)
     }
 
-    /// Reconcile the whole corpus back to `id`'s state in one transaction.
+    /// What restoring to an arbitrary change `hash` (time-travel) would
+    /// change, without changing it.
+    pub fn preview_restore_to(&self, hash: &str) -> Result<RestoreReport> {
+        let h = ChangeHash::from_str(hash).map_err(|e| anyhow!("bad change hash: {e}"))?;
+        Ok(self.plan_restore_to(&[h])?.report)
+    }
+
+    /// Reconcile the whole corpus back to a checkpoint in one transaction.
     /// Whole-corpus by design: this also reverts edits made *after* the
     /// checkpoint (incl. on other devices) — acceptable under the
     /// single-operator model, and the returned report shows the extent.
     pub fn restore_checkpoint(&mut self, id: &str) -> Result<RestoreReport> {
         let plan = self.plan_restore(id)?;
+        self.apply_restore(plan)
+    }
+
+    /// Time-travel restore: reconcile the whole corpus to its state at an
+    /// arbitrary change `hash` from the History timeline. Same engine as
+    /// checkpoint restore — it's just another forward change, so it syncs
+    /// and persists normally.
+    pub fn restore_to(&mut self, hash: &str) -> Result<RestoreReport> {
+        let h = ChangeHash::from_str(hash).map_err(|e| anyhow!("bad change hash: {e}"))?;
+        let plan = self.plan_restore_to(&[h])?;
+        self.apply_restore(plan)
+    }
+
+    fn apply_restore(&mut self, plan: RestorePlan) -> Result<RestoreReport> {
         let ts = now_ms();
         let mut tx = self.doc.transaction();
 
@@ -742,8 +783,56 @@ impl Store {
             tx.put(&obj, "created", t.created)?;
         }
 
-        tx.commit();
+        commit(tx);
         Ok(plan.report)
+    }
+
+    // ---- Edit history --------------------------------------------------
+
+    /// The full edit timeline, newest first: every Automerge change as a
+    /// pure [`HistoryRow`]. Rows whose hash is a checkpoint head carry that
+    /// checkpoint's `reason`, so the History view shows named snapshots
+    /// inline with the raw edits. Any row's `hash` can be fed to
+    /// [`Store::restore_to`] / [`Store::preview_restore_to`].
+    pub fn history(&self) -> Vec<HistoryRow> {
+        // hash hex -> checkpoint reason, for the rows that are snapshots.
+        let mut marks: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Some(cp) = &self.checkpoints {
+            for id in self.doc.keys(cp) {
+                let Some(obj) = child(&self.doc, cp, &id) else {
+                    continue;
+                };
+                let reason = get_str(&self.doc, &obj, "reason");
+                if let Some(hl) = child(&self.doc, &obj, "heads") {
+                    for i in 0..self.doc.length(&hl) {
+                        if let Ok(Some((Value::Scalar(s), _))) = self.doc.get(&hl, i) {
+                            if let ScalarValue::Str(h) = s.as_ref() {
+                                marks.insert(h.to_string(), reason.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut rows: Vec<HistoryRow> = self
+            .doc
+            .get_changes(&[])
+            .into_iter()
+            .map(|c| {
+                let hash = c.hash().to_string();
+                let secs = c.timestamp();
+                HistoryRow {
+                    ts: if secs > 0 { secs * 1000 } else { 0 },
+                    ops: c.len(),
+                    actor: c.actor_id().to_string().chars().take(8).collect(),
+                    checkpoint: marks.get(&hash).cloned(),
+                    hash,
+                }
+            })
+            .collect();
+        rows.reverse(); // newest first for display
+        rows
     }
 }
 
@@ -1114,6 +1203,55 @@ mod tests {
 
         // Empty query never spams the whole corpus.
         assert!(a.search_notes("   ", false).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_lists_changes_and_time_travels() {
+        let dir = std::env::temp_dir().join(format!("ccal-histtest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let aid = a.create_note(&s(&["w"]), "alpha").unwrap();
+        a.set_note_body(&aid, "one").unwrap();
+        // Snapshot of state S1 (alpha="one", no other notes).
+        let s1 = a.history()[0].hash.clone();
+        let cp = a.create_checkpoint("at S1").unwrap();
+
+        // Move on: a second note, and a body rewrite.
+        let bid = a.create_note(&s(&["w"]), "beta").unwrap();
+        a.set_note_body(&aid, "two").unwrap();
+
+        let h = a.history();
+        // Newest first, and strictly growing as we edit.
+        assert!(h.len() >= 5, "every commit is a change: {}", h.len());
+        // The checkpoint's head shows up inline as a named row.
+        assert!(
+            h.iter().any(|r| r.checkpoint.as_deref() == Some("at S1")),
+            "checkpoint tagged in timeline"
+        );
+        // Interactive commits are timestamped (history has a real clock).
+        assert!(h[0].ts > 0, "newest change carries a wall-clock time");
+
+        // Time-travel straight to a raw change (not a checkpoint): the
+        // whole corpus snaps back to S1.
+        let rep = a.restore_to(&s1).unwrap();
+        assert_eq!(rep.notes_deleted, 1); // beta removed
+        assert_eq!(a.note(&aid).unwrap().body, "one");
+        assert!(a.note(&bid).is_none());
+
+        // History is append-only — restore added a change, didn't erase any.
+        assert!(a.history().len() > h.len());
+        // …and the checkpoint is still restorable too (same end state here).
+        a.restore_checkpoint(&cp).unwrap();
+        assert_eq!(a.note(&aid).unwrap().body, "one");
+
+        // It's just another change: a fresh peer converges to the result.
+        sync(&mut a, &mut b);
+        assert_eq!(b.note(&aid).map(|n| n.body), Some("one".to_string()));
+        assert!(b.note(&bid).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

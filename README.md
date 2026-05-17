@@ -112,6 +112,17 @@ assistant has the same thing as a `search_notes` tool — with one
 difference: a private note can only be matched by its title or folder, never
 its hidden body, so search can't be used to fish for secrets.
 
+**History & time travel.** A third tab (`Tab` to cycle to it) shows the
+full edit timeline, newest first — every change, with named snapshots
+marked ★ inline. `c` creates a named snapshot (a checkpoint with a reason);
+`p` previews exactly what restoring a point would change; `r` restores —
+and you can roll back to *any* change in the log, not just named ones, not
+just the assistant's. Restoring isn't a history rewind (Automerge can't do
+that): it's a normal forward edit that snaps the whole corpus back to that
+point, so it syncs to every device like any other change. Because the
+assistant is told to checkpoint before/after each batch, there's always a
+labelled point to come back to if it makes a mess.
+
 
 
 ## Mobile App

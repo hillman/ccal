@@ -9,7 +9,7 @@ use anyhow::Result;
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use ccal::models::{now_ms, Note, NoteMeta, Todo};
+use ccal::models::{now_ms, HistoryRow, Note, NoteMeta, Todo};
 use ccal::store::Store;
 
 use crate::sync_client;
@@ -18,6 +18,7 @@ use crate::sync_client;
 pub enum Tab {
     Todos,
     Notes,
+    History,
 }
 
 pub enum Prompt {
@@ -29,6 +30,8 @@ pub enum Prompt {
     MoveNote(String),
     /// Rename the folder at this full path; buffer edits its last component.
     RenameFolder(Vec<String>),
+    /// Create a named checkpoint; buffer is the reason text.
+    NewCheckpoint,
 }
 
 pub enum Mode {
@@ -75,6 +78,10 @@ pub struct App {
     /// live sync change) so per-keystroke filtering never re-reads every
     /// note body. Empty/ignored outside search.
     search_index: Vec<Note>,
+    /// Edit timeline for the History tab (newest first). Rebuilt on entry
+    /// and on a live sync change; empty/ignored off the tab.
+    pub history: Vec<HistoryRow>,
+    pub hist_sel: usize,
 }
 
 impl App {
@@ -108,6 +115,8 @@ impl App {
             editor: EditorState::new(Lines::default()),
             edit_events: EditorEventHandler::default(),
             search_index: Vec::new(),
+            history: Vec::new(),
+            hist_sel: 0,
         };
         app.refresh();
         Ok(app)
@@ -188,6 +197,11 @@ impl App {
         if matches!(self.mode, Mode::Search { .. }) {
             let notes = self.st().notes();
             self.search_index = notes;
+        }
+        // Likewise keep the timeline live while it's on screen.
+        if self.tab == Tab::History {
+            let h = self.st().history();
+            self.history = h;
         }
         self.entries = self.build_entries();
         self.clamp();
@@ -293,6 +307,9 @@ impl App {
         if self.entry_sel >= rows {
             self.entry_sel = rows.saturating_sub(1);
         }
+        if self.hist_sel >= self.history.len() {
+            self.hist_sel = self.history.len().saturating_sub(1);
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -312,16 +329,25 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab | KeyCode::BackTab => {
-                self.tab = match self.tab {
-                    Tab::Todos => Tab::Notes,
-                    Tab::Notes => Tab::Todos,
+                let fwd = key.code == KeyCode::Tab;
+                self.tab = match (self.tab, fwd) {
+                    (Tab::Todos, true) => Tab::Notes,
+                    (Tab::Notes, true) => Tab::History,
+                    (Tab::History, true) => Tab::Todos,
+                    (Tab::Todos, false) => Tab::History,
+                    (Tab::Notes, false) => Tab::Todos,
+                    (Tab::History, false) => Tab::Notes,
                 };
+                if self.tab == Tab::History {
+                    self.enter_history();
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             _ => match self.tab {
                 Tab::Todos => self.todos_key(key)?,
                 Tab::Notes => self.notes_key(key)?,
+                Tab::History => self.hist_key(key)?,
             },
         }
         Ok(())
@@ -332,6 +358,7 @@ impl App {
         let (sel, len) = match self.tab {
             Tab::Todos => (&mut self.todo_sel, self.todos.len()),
             Tab::Notes => (&mut self.entry_sel, rows),
+            Tab::History => (&mut self.hist_sel, self.history.len()),
         };
         if len == 0 {
             return;
@@ -549,6 +576,66 @@ impl App {
         Ok(())
     }
 
+    // ---- History -------------------------------------------------------
+
+    fn enter_history(&mut self) {
+        let h = self.st().history();
+        self.history = h;
+        self.hist_sel = 0;
+        self.status =
+            "History — ↑↓ select · p preview · r restore (whole corpus) · c name a snapshot"
+                .into();
+    }
+
+    fn hist_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('c') => {
+                self.mode = Mode::Input {
+                    prompt: Prompt::NewCheckpoint,
+                    buffer: String::new(),
+                };
+                self.status = "Snapshot reason — Enter: create · Esc: cancel".into();
+            }
+            KeyCode::Char('p') | KeyCode::Enter => {
+                if let Some(row) = self.history.get(self.hist_sel).cloned() {
+                    // Bind first so the store guard is dropped before we
+                    // touch `self.status` (st() borrows self).
+                    let res = self.st().preview_restore_to(&row.hash);
+                    self.status = match res {
+                        Ok(r) => format!(
+                            "Preview: notes +{}/~{}/-{} · todos +{}/~{}/-{} — press r to \
+                             restore the WHOLE corpus to this point",
+                            r.notes_added, r.notes_updated, r.notes_deleted,
+                            r.todos_added, r.todos_updated, r.todos_deleted,
+                        ),
+                        Err(e) => format!("Preview failed: {e}"),
+                    };
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(row) = self.history.get(self.hist_sel).cloned() {
+                    let res = self.st().restore_to(&row.hash);
+                    let msg = match res {
+                        Ok(r) => {
+                            self.persist();
+                            format!(
+                                "Restored to {} — notes +{}/~{}/-{} · todos +{}/~{}/-{}",
+                                &row.hash[..8.min(row.hash.len())],
+                                r.notes_added, r.notes_updated, r.notes_deleted,
+                                r.todos_added, r.todos_updated, r.todos_deleted,
+                            )
+                        }
+                        Err(e) => format!("Restore failed: {e}"),
+                    };
+                    self.refresh();
+                    self.status = msg;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // ---- Input ---------------------------------------------------------
 
     fn input_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -652,6 +739,23 @@ impl App {
                             self.status =
                                 format!("Editing (INSERT){at} — Esc then q to save & close");
                         }
+                    }
+                    Prompt::NewCheckpoint => {
+                        let msg = if text.is_empty() {
+                            "Empty reason — snapshot cancelled".to_string()
+                        } else {
+                            let res = self.st().create_checkpoint(&text);
+                            match res {
+                                Ok(_) => {
+                                    self.persist();
+                                    format!("Snapshot created: {text}")
+                                }
+                                Err(e) => format!("Snapshot failed: {e}"),
+                            }
+                        };
+                        self.mode = Mode::Normal;
+                        self.refresh();
+                        self.status = msg;
                     }
                 }
             }

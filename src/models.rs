@@ -85,6 +85,20 @@ pub struct RestoreReport {
     pub todos_updated: usize,
 }
 
+/// One entry in the document's edit timeline (an Automerge change).
+/// `ts` is epoch-ms (0 = unknown: pre-dates timestamped commits, or
+/// genesis). `checkpoint` is the reason text when this change is a named
+/// checkpoint's head, so the History view can show snapshots inline.
+#[derive(Clone, Debug, Default)]
+pub struct HistoryRow {
+    pub hash: String,
+    pub ts: i64,
+    pub ops: usize,
+    /// Short actor id (which replica/session made it).
+    pub actor: String,
+    pub checkpoint: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Todo {
     pub id: String,

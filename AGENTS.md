@@ -153,7 +153,8 @@ edtui. tui-textarea was removed.
 
 ## TUI keys
 
-Global: `Tab` switch view · `q` quit · `j/k`/arrows move.
+Global: `Tab`/`BackTab` cycle Todos→Notes→History · `q` quit · `j/k`/arrows
+move.
 Todos: `a` add · `e`/`Enter` edit · `d` delete · `J`/`K` reorder.
 Notes: `Enter`/`→` open or descend · `←`/`h` up · `n` new · `R` rename ·
 `m` move note · `p` toggle private (hide body from the LLM) · `/` search ·
@@ -166,6 +167,25 @@ Notes: `Enter`/`→` open or descend · `←`/`h` up · `n` new · `R` rename ·
   materialized once on `/` into `App::search_index` (and refreshed on a
   live sync change) so per-keystroke filtering never re-reads bodies.
   `flat_list()` (root **or** searching) drives the no-".."-row logic.
+History tab: the edit timeline, newest first (`Store::history()` →
+`Vec<HistoryRow>`: every Automerge change as hash/ts/ops/actor, plus the
+checkpoint `reason` inline when a change is a named snapshot's head). Keys:
+`↑↓` select · `p`/`Enter` preview the blast radius · `r` restore (whole
+corpus, **time-travel to any change**, not just checkpoints) · `c` create a
+named snapshot (`Prompt::NewCheckpoint` → `create_checkpoint`).
+- Restore reuses the checkpoint engine: `plan_restore_to(&heads)` +
+  `apply_restore`; `restore_to(hash)`/`preview_restore_to(hash)` are the
+  arbitrary-point entry points, `restore_checkpoint` just resolves a
+  checkpoint's heads first. So time-travel is *one ordinary forward
+  change* and syncs/persists with zero special-casing (proven by
+  `history_lists_changes_and_time_travels`).
+- **Commits are timestamped.** All interactive commits go through the
+  private `commit(tx)` helper (`CommitOptions::with_time(now_secs())`) so
+  the timeline has a real clock; the timestamp is advisory (not used in
+  merge) so convergence is unaffected. **`genesis_doc` is the lone
+  exception** — it must stay `with_time(0)` to keep the byte-identical
+  ancestor; never route it through `commit()`. Pre-existing changes (and
+  genesis) have ts 0 → shown as "—".
 
 - **Folders are created implicitly** — there is no "make folder" command
   (none can exist: folders are derived, an empty one has nothing to derive
