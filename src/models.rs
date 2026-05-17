@@ -99,6 +99,22 @@ pub struct HistoryRow {
     pub checkpoint: Option<String>,
 }
 
+/// A calendar *subscription* — the small, user-authored thing that syncs
+/// (the fetched events do **not**; they are a per-device local cache, see
+/// `cal_sync`). Stored one-per-`ROOT["cal/<id>"]` so it converges without a
+/// genesis change (unique key, single creating replica), unlike a shared
+/// `calendars` container map would.
+#[derive(Clone, Debug, Default)]
+pub struct Calendar {
+    pub id: String,
+    /// The ICS URL the user pasted (Google "secret iCal" / Proton link).
+    pub url: String,
+    /// Display name: user-given, else backfilled from the feed's
+    /// `X-WR-CALNAME` on first successful fetch.
+    pub name: String,
+    pub created: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Todo {
     pub id: String,

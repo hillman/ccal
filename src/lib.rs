@@ -4,6 +4,7 @@
 //! as one binary blob). Everything — the TUI and the standalone Bear
 //! importer — goes through [`store::Store`]; nothing else touches Automerge.
 
+pub mod calendar;
 pub mod config;
 pub mod models;
 pub mod store;

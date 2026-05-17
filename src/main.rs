@@ -2,6 +2,7 @@
 //! (`import-bear`) and is intentionally not reachable from here.
 
 mod app;
+mod cal_sync;
 mod sync_client;
 mod ui;
 

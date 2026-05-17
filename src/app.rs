@@ -9,15 +9,18 @@ use anyhow::Result;
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use ccal::models::{now_ms, HistoryRow, Note, NoteMeta, Todo};
+use ccal::calendar::Occurrence;
+use ccal::models::{now_ms, Calendar, HistoryRow, Note, NoteMeta, Todo};
 use ccal::store::Store;
 
+use crate::cal_sync::{self, CalStatus};
 use crate::sync_client;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Tab {
     Todos,
     Notes,
+    Calendar,
     History,
 }
 
@@ -32,6 +35,8 @@ pub enum Prompt {
     RenameFolder(Vec<String>),
     /// Create a named checkpoint; buffer is the reason text.
     NewCheckpoint,
+    /// Subscribe to a calendar; buffer is the pasted ICS URL.
+    AddCalendar,
 }
 
 pub enum Mode {
@@ -82,6 +87,20 @@ pub struct App {
     /// and on a live sync change; empty/ignored off the tab.
     pub history: Vec<HistoryRow>,
     pub hist_sel: usize,
+
+    /// Background ICS fetch thread (always spawned — fetching needs no sync
+    /// server). The UI never blocks on it.
+    cal: cal_sync::Handle,
+    /// Cached, locally-derived (never synced) occurrences in the window,
+    /// refreshed from `cal` on its dirty flag.
+    pub cal_occ: Vec<Occurrence>,
+    /// Per-subscription fetch status for the manager view.
+    pub cal_status: Vec<CalStatus>,
+    /// Calendar subscriptions (synced) — shown in the manager.
+    pub cal_subs: Vec<Calendar>,
+    /// Calendar tab is in the manage sub-view (list + delete) vs. agenda.
+    pub cal_manage: bool,
+    pub cal_sel: usize,
 }
 
 impl App {
@@ -98,6 +117,13 @@ impl App {
             }
             _ => None,
         };
+
+        // The calendar thread is independent of doc-sync: ICS feeds are
+        // fetched directly over HTTPS, so it runs even standalone.
+        let cal = cal_sync::spawn(
+            store.clone(),
+            std::time::Duration::from_secs(cfg.calendar_refresh_secs()),
+        );
 
         let mut app = Self {
             store,
@@ -117,6 +143,12 @@ impl App {
             search_index: Vec::new(),
             history: Vec::new(),
             hist_sel: 0,
+            cal,
+            cal_occ: Vec::new(),
+            cal_status: Vec::new(),
+            cal_subs: Vec::new(),
+            cal_manage: false,
+            cal_sel: 0,
         };
         app.refresh();
         Ok(app)
@@ -144,6 +176,26 @@ impl App {
     /// merged, and surface connection state without clobbering transient
     /// action messages.
     pub fn tick(&mut self) {
+        // Calendar cache is independent of doc-sync — poll it first and
+        // unconditionally. Cheap atomic check; only copies on a real change.
+        if self.cal.dirty.swap(false, Ordering::SeqCst) {
+            self.cal_occ = self
+                .cal
+                .occurrences
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            self.cal_status = self
+                .cal
+                .statuses
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            // A name backfill writes to the doc; keep the manager list fresh.
+            { let subs = self.st().calendars(); self.cal_subs = subs; }
+            self.clamp();
+        }
+
         let Some(sync) = &self.sync else { return };
         let dirty = sync.dirty.clone();
         let status_arc = sync.status.clone();
@@ -207,6 +259,7 @@ impl App {
             let h = self.st().history();
             self.history = h;
         }
+        { let subs = self.st().calendars(); self.cal_subs = subs; }
         self.entries = self.build_entries();
         self.clamp();
     }
@@ -314,6 +367,10 @@ impl App {
         if self.hist_sel >= self.history.len() {
             self.hist_sel = self.history.len().saturating_sub(1);
         }
+        let cal_len = if self.cal_manage { self.cal_subs.len() } else { self.cal_occ.len() };
+        if self.cal_sel >= cal_len {
+            self.cal_sel = cal_len.saturating_sub(1);
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -336,14 +393,18 @@ impl App {
                 let fwd = key.code == KeyCode::Tab;
                 self.tab = match (self.tab, fwd) {
                     (Tab::Todos, true) => Tab::Notes,
-                    (Tab::Notes, true) => Tab::History,
+                    (Tab::Notes, true) => Tab::Calendar,
+                    (Tab::Calendar, true) => Tab::History,
                     (Tab::History, true) => Tab::Todos,
                     (Tab::Todos, false) => Tab::History,
                     (Tab::Notes, false) => Tab::Todos,
-                    (Tab::History, false) => Tab::Notes,
+                    (Tab::Calendar, false) => Tab::Notes,
+                    (Tab::History, false) => Tab::Calendar,
                 };
                 if self.tab == Tab::History {
                     self.enter_history();
+                } else if self.tab == Tab::Calendar {
+                    self.enter_calendar();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
@@ -351,6 +412,7 @@ impl App {
             _ => match self.tab {
                 Tab::Todos => self.todos_key(key)?,
                 Tab::Notes => self.notes_key(key)?,
+                Tab::Calendar => self.cal_key(key)?,
                 Tab::History => self.hist_key(key)?,
             },
         }
@@ -362,6 +424,10 @@ impl App {
         let (sel, len) = match self.tab {
             Tab::Todos => (&mut self.todo_sel, self.todos.len()),
             Tab::Notes => (&mut self.entry_sel, rows),
+            Tab::Calendar => (
+                &mut self.cal_sel,
+                if self.cal_manage { self.cal_subs.len() } else { self.cal_occ.len() },
+            ),
             Tab::History => (&mut self.hist_sel, self.history.len()),
         };
         if len == 0 {
@@ -640,6 +706,55 @@ impl App {
         Ok(())
     }
 
+    // ---- Calendar ------------------------------------------------------
+
+    fn enter_calendar(&mut self) {
+        { let subs = self.st().calendars(); self.cal_subs = subs; }
+        self.cal_sel = 0;
+        self.status = if self.cal_subs.is_empty() {
+            "Calendar — a: add a calendar (paste an ICS URL) · no calendars yet".into()
+        } else {
+            "Calendar — a add · r refresh · m manage/delete".into()
+        };
+    }
+
+    fn cal_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('a') => {
+                self.mode = Mode::Input { prompt: Prompt::AddCalendar, buffer: String::new() };
+                self.status = "Paste an ICS URL — Enter: subscribe · Esc: cancel".into();
+            }
+            KeyCode::Char('r') => {
+                self.cal.refresh_now.store(true, Ordering::SeqCst);
+                self.status = "Refreshing calendars…".into();
+            }
+            KeyCode::Char('m') => {
+                self.cal_manage = !self.cal_manage;
+                self.cal_sel = 0;
+                self.status = if self.cal_manage {
+                    "Manage calendars — ↑↓ select · d delete · m back to agenda".into()
+                } else {
+                    "Calendar — a add · r refresh · m manage/delete".into()
+                };
+            }
+            KeyCode::Char('d') if self.cal_manage => {
+                if let Some(c) = self.cal_subs.get(self.cal_sel).cloned() {
+                    self.st().remove_calendar(&c.id)?;
+                    self.persist();
+                    { let subs = self.st().calendars(); self.cal_subs = subs; }
+                    // Drop its events immediately; a refetch confirms.
+                    self.cal_occ.retain(|o| o.calendar != c.name);
+                    self.cal.refresh_now.store(true, Ordering::SeqCst);
+                    self.clamp();
+                    let label = if c.name.is_empty() { c.url } else { c.name };
+                    self.status = format!("Removed calendar '{label}'");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // ---- Input ---------------------------------------------------------
 
     fn input_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -759,6 +874,36 @@ impl App {
                         };
                         self.mode = Mode::Normal;
                         self.refresh();
+                        self.status = msg;
+                    }
+                    Prompt::AddCalendar => {
+                        let url = text;
+                        let msg = if url.is_empty() {
+                            "Empty URL — cancelled".to_string()
+                        } else if !(url.starts_with("http://")
+                            || url.starts_with("https://")
+                            || url.starts_with("webcal://"))
+                        {
+                            "Not a URL — expected http(s):// or webcal://".to_string()
+                        } else {
+                            // webcal:// is just ICS-over-HTTPS with a custom
+                            // scheme; normalise so the fetcher can GET it.
+                            let url = url
+                                .strip_prefix("webcal://")
+                                .map(|r| format!("https://{r}"))
+                                .unwrap_or(url);
+                            let res = self.st().add_calendar(&url, "");
+                            match res {
+                                Ok(_) => {
+                                    self.persist();
+                                    { let subs = self.st().calendars(); self.cal_subs = subs; }
+                                    self.cal.refresh_now.store(true, Ordering::SeqCst);
+                                    "Calendar added — fetching…".to_string()
+                                }
+                                Err(e) => format!("Add failed: {e}"),
+                            }
+                        };
+                        self.mode = Mode::Normal;
                         self.status = msg;
                     }
                 }

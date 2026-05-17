@@ -9,6 +9,8 @@ use ratatui::{
     Frame,
 };
 
+use chrono::Local;
+
 use crate::app::{App, Entry, Mode, Prompt, Tab};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -49,6 +51,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         _ => match app.tab {
             Tab::Todos => draw_todos(f, app, chunks[1]),
             Tab::Notes => draw_notes(f, app, chunks[1]),
+            Tab::Calendar => draw_calendar(f, app, chunks[1]),
             Tab::History => draw_history(f, app, chunks[1]),
         },
     }
@@ -62,6 +65,8 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Todos ", if app.tab == Tab::Todos { sel } else { unsel }),
         Span::raw("  "),
         Span::styled(" Notes ", if app.tab == Tab::Notes { sel } else { unsel }),
+        Span::raw("  "),
+        Span::styled(" Calendar ", if app.tab == Tab::Calendar { sel } else { unsel }),
         Span::raw("  "),
         Span::styled(" History ", if app.tab == Tab::History { sel } else { unsel }),
     ];
@@ -198,6 +203,131 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// The Calendar tab: a read-only agenda (Today, then the next 7 days), or
+/// the manage sub-view (subscriptions + fetch status). All event times are
+/// rendered in the local timezone.
+fn draw_calendar(f: &mut Frame, app: &App, area: Rect) {
+    if app.cal_manage {
+        draw_cal_manage(f, app, area);
+        return;
+    }
+
+    let today = Local::now().date_naive();
+    let day_label = |d: chrono::NaiveDate| d.format("%a %-d %b").to_string();
+
+    // Bucket occurrences by their *local* start date (already sorted by
+    // absolute start, which stays ordered after the offset).
+    let line = |o: &ccal::calendar::Occurrence| -> String {
+        let s = o.start.with_timezone(&Local);
+        if o.all_day {
+            format!("  • all day   {}", o.summary)
+        } else {
+            let e = o.end.with_timezone(&Local);
+            let loc = if o.location.is_empty() {
+                String::new()
+            } else {
+                format!("   · {}", o.location)
+            };
+            format!("  {}–{}  {}{}", s.format("%H:%M"), e.format("%H:%M"), o.summary, loc)
+        }
+    };
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let section = |items: &mut Vec<ListItem>, title: String| {
+        items.push(ListItem::new(Span::styled(
+            title,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+    };
+
+    section(&mut items, format!("Today — {}", day_label(today)));
+    let mut today_hits = 0;
+    for o in &app.cal_occ {
+        if o.start.with_timezone(&Local).date_naive() == today {
+            items.push(ListItem::new(line(o)));
+            today_hits += 1;
+        }
+    }
+    if today_hits == 0 {
+        items.push(ListItem::new(Span::styled(
+            "  (nothing scheduled)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    items.push(ListItem::new(""));
+    section(&mut items, "This week".to_string());
+    for n in 1..=7 {
+        let d = today + chrono::Duration::days(n);
+        section(&mut items, format!("  {}", day_label(d)));
+        let mut hits = 0;
+        for o in &app.cal_occ {
+            if o.start.with_timezone(&Local).date_naive() == d {
+                items.push(ListItem::new(line(o)));
+                hits += 1;
+            }
+        }
+        if hits == 0 {
+            items.push(ListItem::new(Span::styled(
+                "    —",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let n = app.cal_subs.len();
+    let title = format!(
+        " Calendar — {n} subscribed  (a add · r refresh · m manage) "
+    );
+    f.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+fn draw_cal_manage(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.cal_subs.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  No calendars — press a to paste an ICS URL",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.cal_subs
+            .iter()
+            .map(|c| {
+                let st = app.cal_status.iter().find(|s| s.id == c.id);
+                let name = if c.name.is_empty() { c.url.clone() } else { c.name.clone() };
+                let (detail, style) = match st {
+                    Some(s) if s.error.is_some() => (
+                        format!("⚠ {}", s.error.as_deref().unwrap_or("error")),
+                        Style::default().fg(Color::Red),
+                    ),
+                    Some(s) if s.last_ok > 0 => (
+                        format!("{} events · synced {}", s.events, ago(s.last_ok)),
+                        Style::default().fg(Color::Green),
+                    ),
+                    _ => ("fetching…".to_string(), Style::default().fg(Color::DarkGray)),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("📅 {name}  ")),
+                    Span::styled(detail, style),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(
+            " Manage calendars  (↑↓ select · d delete · a add · m back to agenda) ",
+        ))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    if !app.cal_subs.is_empty() {
+        state.select(Some(app.cal_sel));
+    }
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 /// One-line hint shown above the input field, tailored to what's being
 /// asked. Kept here (presentation) rather than in `app` so the state
 /// machine stays free of UI copy.
@@ -220,6 +350,10 @@ fn input_hint(prompt: &Prompt) -> &'static str {
         }
         Prompt::NewCheckpoint => {
             "Snapshot reason — what is this restore point?  ·  Enter  ·  Esc"
+        }
+        Prompt::AddCalendar => {
+            "Paste an ICS URL (Google “secret iCal” / Proton published \
+             link)  ·  Enter subscribe  ·  Esc"
         }
     }
 }

@@ -3,8 +3,9 @@
 A fast terminal app for **markdown notes and todos** with **offline-first,
 multi-device sync** (Automerge CRDT) and an **optional MCP server** that lets
 an LLM assistant help organise your notes — safely. Single static Rust
-binary, no runtime dependencies. (Light calendar bits are planned; the
-calendar is deliberately secondary.)
+binary, no runtime dependencies. There's also a read-only **Calendar tab**
+that subscribes to ICS feeds — deliberately secondary, just today + the week
+at a glance.
 
 ## Features
 
@@ -46,6 +47,13 @@ calendar is deliberately secondary.)
 - **Full-text search.** `/` searches titles, folder paths and bodies
   live; the assistant gets the same as a privacy-respecting `search_notes`
   tool.
+- **Calendar (read-only).** Subscribe to ICS URLs — Google's per-calendar
+  "Secret address in iCal format" and Proton's published-calendar link both
+  work (no OAuth, no CalDAV). The Calendar tab shows today's agenda then the
+  next 7 days; recurring events (RRULE/EXDATE) and timezones are expanded
+  properly. Subscriptions sync like notes/todos; the fetched events are a
+  per-device local cache refreshed every 5 min (or on demand), so the doc
+  never bloats. `a` add · `r` refresh · `m` manage/delete.
 - **Bear import.** One-shot `import-bear` reads the Bear app's SQLite
   read-only and maps nested tags to nested folders.
 - **Configure your way.** Optional TOML config or `CCAL_*` env vars (env
@@ -56,7 +64,7 @@ calendar is deliberately secondary.)
 
 Way back in the day, when I was at university, myself and a friend made a curses based calendar/todo list app called Ccal.  We loved it and it had a niche community of people who used it, it was fun.  But work got in the way and it died.  I thought, in this age of LLM assisted side projects, where you can get much more done with the limited time you have, that I'd have a go at ressurecting it in Rust.  It's a spiritual successor, not a re-build. 
 
-It's for notes, todos and (not implemented yet) calendar stuff.  Despite the name, the calendar bit is actually secondary and will really just be about pulling in today's events from other calendars and having timed todos.  It isn't a fully fledged calendar.
+It's for notes, todos and calendar stuff.  Despite the name, the calendar bit is actually secondary: it just pulls in today's events from other calendars (read-only ICS subscriptions) for a glance at today and the week ahead.  It isn't a fully fledged calendar, and won't be.
 
 I've built it in Rust for a nice quick UI and easy executable builds.  It uses Automerge as both the storage format and the sync protocol, which is what makes the self-hosted sync server (and the live LLM integration) work.
 

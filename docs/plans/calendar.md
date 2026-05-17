@@ -1,6 +1,16 @@
 # Calendar plan — ICS subscriptions, read-only
 
-Status: planned. Decisions made 2026-05-17.
+Status: **implemented** 2026-05-17. Decisions made 2026-05-17.
+
+Implementation notes (where it differs from the plan below): subscriptions
+are stored as a per-calendar `ROOT["cal/<uuid>"]` **Map** (url/name/created),
+not a scalar string — same convergence reasoning (unique key, single
+creating replica, no shared parent container, no genesis change) but
+idiomatic to the existing notes/todos modelling. Modules landed as
+`ccal::calendar` (pure parse+expand, lib) and `src/cal_sync.rs` (TUI-private
+fetch thread). `webcal://` URLs are accepted and normalised to `https://`.
+v1 keeps a single agenda view (Today + next 7 days) plus an `m` manage
+sub-view for add/delete/status; no per-calendar colour.
 
 ## Goal & scope
 

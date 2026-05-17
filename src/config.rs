@@ -40,6 +40,16 @@ pub struct Config {
     pub client: ClientConfig,
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub calendar: CalendarConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CalendarConfig {
+    /// How often (seconds) the TUI refetches each subscribed ICS feed.
+    /// Default 300 (5 min); the `r` key forces an immediate refresh
+    /// regardless.
+    pub refresh_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -136,6 +146,19 @@ impl Config {
             ),
             Err(_) => self.server.mcp.unwrap_or(false),
         }
+    }
+
+    /// Calendar refresh interval in seconds: `$CCAL_CAL_REFRESH` >
+    /// `[calendar] refresh_secs` > `300`. Clamped to a sane floor so a
+    /// typo can't hammer providers.
+    pub fn calendar_refresh_secs(&self) -> u64 {
+        let v = match std::env::var("CCAL_CAL_REFRESH") {
+            Ok(s) => s.trim().parse::<u64>().ok(),
+            Err(_) => None,
+        }
+        .or(self.calendar.refresh_secs)
+        .unwrap_or(300);
+        v.max(30)
     }
 
     /// Docid the MCP server operates on: `$CCAL_MCP_DOC` >

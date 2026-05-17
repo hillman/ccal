@@ -16,6 +16,12 @@
 //! - `notes`:  Map  id -> { title:Str, folder:List<Str>, body:Text,
 //!                           created:Int, modified:Int }
 //! - `todos`:  Map  id -> { text:Str, order:F64, created:Int }
+//! - `cal/<id>`: Map { url:Str, name:Str, created:Int }
+//!
+//! Each calendar *subscription* is its own `cal/<id>` ROOT key (not a child
+//! of a shared `calendars` map) so it converges with no genesis change.
+//! Fetched events are NOT stored in the doc — they are a non-synced local
+//! cache (see the TUI's `cal_sync`).
 
 use anyhow::{anyhow, Context, Result};
 use automerge::sync::{Message as AmSyncMessage, SyncDoc};
@@ -32,10 +38,16 @@ use automerge::ChangeHash;
 use std::str::FromStr;
 
 use crate::models::{
-    new_id, now_ms, Checkpoint, HistoryRow, Note, NoteInput, NoteMeta, RestoreReport, Todo,
+    new_id, now_ms, Calendar, Checkpoint, HistoryRow, Note, NoteInput, NoteMeta, RestoreReport,
+    Todo,
 };
 
 const SCHEMA: i64 = 1;
+
+/// Prefix for the per-calendar ROOT keys (`cal/<uuid>`). See [`Store`] doc:
+/// each subscription is its own `ROOT` entry, not a child of a shared
+/// container, so it converges with no genesis change.
+const CAL_PREFIX: &str = "cal/";
 
 /// Wall-clock seconds — Automerge change timestamps are unix *seconds*.
 fn now_secs() -> i64 {
@@ -639,6 +651,76 @@ impl Store {
         tx.delete(&self.todos, id)?;
         commit(tx);
         Ok(())
+    }
+
+    // ---- Calendars -----------------------------------------------------
+    //
+    // Only the *subscription* lives in the doc (and thus syncs to the
+    // server and other devices). Each is its own `ROOT["cal/<uuid>"]` map:
+    // the uuid is unique and created by exactly one replica, so — unlike a
+    // shared `calendars` container — there is no concurrent-seed divergence
+    // and no need to touch `genesis_doc`. The fetched events are a derived,
+    // non-synced local cache (see the TUI's `cal_sync`).
+
+    /// Subscribe to an ICS calendar URL. `name` may be empty; the fetch
+    /// thread backfills it from the feed's `X-WR-CALNAME`.
+    pub fn add_calendar(&mut self, url: &str, name: &str) -> Result<String> {
+        let id = new_id();
+        let key = format!("{CAL_PREFIX}{id}");
+        let ts = now_ms();
+        let mut tx = self.doc.transaction();
+        let obj = tx.put_object(ROOT, key.as_str(), ObjType::Map)?;
+        tx.put(&obj, "url", url)?;
+        tx.put(&obj, "name", name)?;
+        tx.put(&obj, "created", ts)?;
+        commit(tx);
+        Ok(id)
+    }
+
+    /// Set the display name (used to apply `X-WR-CALNAME` after a fetch, or
+    /// a user rename). No-op-safe if the calendar is gone.
+    pub fn set_calendar_name(&mut self, id: &str, name: &str) -> Result<()> {
+        let key = format!("{CAL_PREFIX}{id}");
+        let Some(obj) = child(&self.doc, &ROOT, &key) else {
+            return Ok(());
+        };
+        let mut tx = self.doc.transaction();
+        tx.put(&obj, "name", name)?;
+        commit(tx);
+        Ok(())
+    }
+
+    pub fn remove_calendar(&mut self, id: &str) -> Result<()> {
+        let key = format!("{CAL_PREFIX}{id}");
+        let mut tx = self.doc.transaction();
+        tx.delete(ROOT, key.as_str())?;
+        commit(tx);
+        Ok(())
+    }
+
+    /// All subscriptions, by name (case-insensitive), ties by id.
+    pub fn calendars(&self) -> Vec<Calendar> {
+        let mut v: Vec<Calendar> = self
+            .doc
+            .keys(ROOT)
+            .filter(|k| k.starts_with(CAL_PREFIX))
+            .filter_map(|k| {
+                let obj = child(&self.doc, &ROOT, &k)?;
+                Some(Calendar {
+                    id: k[CAL_PREFIX.len()..].to_string(),
+                    url: get_str(&self.doc, &obj, "url"),
+                    name: get_str(&self.doc, &obj, "name"),
+                    created: get_i64(&self.doc, &obj, "created"),
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        v
     }
 
     // ---- Checkpoints ---------------------------------------------------
@@ -1506,6 +1588,40 @@ mod tests {
         assert_eq!(priv_hit.len(), 1);
         assert!(priv_hit[0].0.private);
         assert!(priv_hit[0].1.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_subscriptions_sync_without_genesis_change() {
+        let dir = std::env::temp_dir().join(format!("ccal-caltest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+
+        // Two replicas each add a calendar *before* ever syncing — the
+        // exact concurrent-seed scenario that breaks a shared container
+        // map. Unique `cal/<uuid>` keys mean both survive the merge.
+        let ca = a.add_calendar("https://a.example/x.ics", "Work").unwrap();
+        let cb = b.add_calendar("https://b.example/y.ics", "").unwrap();
+        sync(&mut a, &mut b);
+
+        for s in [&a, &b] {
+            let cals = s.calendars();
+            assert_eq!(cals.len(), 2, "both subscriptions converge");
+            assert!(cals.iter().any(|c| c.id == ca && c.url == "https://a.example/x.ics"));
+            assert!(cals.iter().any(|c| c.id == cb));
+        }
+
+        // Name backfill (what the fetch thread does after reading
+        // X-WR-CALNAME) and removal both ride sync like any edit.
+        b.set_calendar_name(&cb, "Personal").unwrap();
+        a.remove_calendar(&ca).unwrap();
+        sync(&mut a, &mut b);
+        let cals = b.calendars();
+        assert_eq!(cals.len(), 1);
+        assert_eq!(cals[0].id, cb);
+        assert_eq!(cals[0].name, "Personal");
+        assert!(a.calendars().iter().all(|c| c.id != ca), "removal converged");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -55,6 +55,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # (CCAL_MCP / `[server] mcp`); absent ⇒ this code never runs.
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "macros"] }
 tokio-util = "0.7"
+ureq = "3.3.0"
+icalendar = "0.17.10"
+rrule = "0.14.0"
+chrono = "0.4.44"
+chrono-tz = "0.10.4"
 
 [dev-dependencies]
 # End-to-end test drives the real ccal-server binary over WebSockets.

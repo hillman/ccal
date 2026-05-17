@@ -65,3 +65,13 @@
 # assistant edits a different replica.
 # Default: "ccal"   ·   Env override: CCAL_MCP_DOC
 #mcp_doc = "ccal"
+
+
+[calendar]
+# The Calendar tab subscribes to read-only ICS feeds (Google's per-calendar
+# "Secret address in iCal format", or a Proton published calendar link).
+# Add one in the TUI: Calendar tab -> `a` -> paste the URL. Subscriptions
+# sync to the server like notes/todos; the fetched events are a local,
+# non-synced cache refetched on this interval (the `r` key forces it).
+# Floor is 30s. Default: 300 (5 min)   ·   Env override: CCAL_CAL_REFRESH
+#refresh_secs = 300

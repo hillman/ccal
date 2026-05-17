@@ -16,22 +16,26 @@ that, ccal is the source of truth and Bear is irrelevant.
 Single package, one library + two binaries:
 
 ```
-src/lib.rs            crate `ccal`  ── pub mod models; pub mod store;
+src/lib.rs            crate `ccal`  ── pub mod models; store; calendar;
 src/models.rs         pure domain types, no Automerge / no I/O
 src/store.rs          THE ONLY place that knows Automerge exists
+src/calendar.rs       pure ICS parse + recurrence expand, no I/O / no net
 src/main.rs           `ccal` TUI binary entry (event loop, terminal setup)
 src/app.rs            TUI state machine + key handling   (binary-private)
 src/ui.rs             ratatui rendering                  (binary-private)
-src/sync_client.rs    background sync thread             (binary-private)
+src/sync_client.rs    background doc-sync thread         (binary-private)
+src/cal_sync.rs       background ICS fetch thread        (binary-private)
 src/server_mcp.rs     optional embedded MCP server  (ccal-server-private,
                       pulled in via #[path] — never compiled into the lib)
 src/bin/import-bear.rs `import-bear` binary — standalone one-shot importer
 src/bin/ccal-server.rs  `ccal-server` binary — Automerge sync peer (+ MCP)
 ```
 
-Hard rule: `import-bear`, `ccal-server` and the TUI share **only**
-`ccal::store` / `ccal::models`. They must never touch `app`/`ui`; nothing
-outside `store.rs` may use the `automerge` crate. All async/transport
+Hard rule: `import-bear`, `ccal-server` and the TUI share **only** the pure
+lib (`ccal::store` / `ccal::models` / `ccal::calendar`). They must never
+touch `app`/`ui`; nothing outside `store.rs` may use the `automerge` crate.
+`calendar.rs` is pure (no I/O, no net) — the network fetch lives in the
+TUI-private `cal_sync.rs`, exactly as transport stays out of the lib. All async/transport
 (tokio, axum) lives in `ccal-server` only — the lib stays tokio-free.
 
 ## Data model
