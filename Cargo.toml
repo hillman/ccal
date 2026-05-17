@@ -20,7 +20,7 @@ name = "ccal-server"
 path = "src/bin/ccal-server.rs"
 
 [dependencies]
-automerge = "0.7"
+automerge = "0.9"
 uuid = { version = "1", features = ["v4"] }
 directories = "5"
 anyhow = "1"

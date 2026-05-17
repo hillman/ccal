@@ -143,8 +143,21 @@ trashed/archived/encrypted notes. Files a note under its most specific tag;
 nested tags (`a/b`) → nested folders; untagged → `Untagged`. It is additive
 — re-running appends duplicates (one-shot by design).
 
-Toolchain: needs **rustc ≥ 1.89** (Automerge 0.7). Dev machine is on
+Toolchain: needs **rustc ≥ 1.89** (Automerge 0.9). Dev machine is on
 Homebrew rust 1.95.
+
+**Automerge `MissingOps` panic — do NOT reintroduce `get_changes`/`fork_at`.**
+`Automerge::get_changes(&[])` and `fork_at(heads)` reconstruct changes from
+the op-set and internally `unwrap()` an `Err(MissingOps)` when the op range
+has holes (normal once history has merged via sync). It's an upstream panic
+present *unchanged in 0.7.4 → 0.9.0* (not a version bug; upgrading doesn't
+fix it). Therefore: `Store::history()` uses `get_changes_meta(&[])`
+(change-graph metadata only, no op reconstruction) and `plan_restore_to`
+reads past state with the clock-based `*_at` ReadDoc API (`keys_at`,
+`get_at`, `text_at`, `length_at` — the `*_at` free helpers) instead of
+forking. `plan_restore_to` also validates every target head via
+`get_change_meta_by_hash` first: unknown heads would make every `*_at` read
+empty and a restore would then wipe the corpus. Keep it this way.
 
 UI stack: **ratatui 0.30** + **edtui 0.11** (Vim editor, syntect markdown
 highlighting). crossterm is **not a direct dependency** — always import it

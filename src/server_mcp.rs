@@ -60,6 +60,44 @@ pub struct ListNotesArgs {
     /// the whole corpus.
     #[serde(default)]
     pub folder: Option<Vec<String>>,
+    /// Max notes to return (the page size). Omit for "no limit", but on a
+    /// large corpus prefer paging — the body-free listing is still big.
+    /// Results are ordered by folder path, then title, then id, so paging
+    /// with `offset` is stable.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// How many notes to skip before the page (default 0). Pair with
+    /// `limit` to walk the corpus.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Optional projection: which fields to include per note. `id` is
+    /// always returned (it's the handle). Valid: `title`, `folder`,
+    /// `created`, `modified`, `private`. Omit for all fields.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveNotesArgs {
+    /// The note ids to move (as returned by `list_notes`). Unknown ids are
+    /// silently skipped.
+    pub ids: Vec<String>,
+    /// Destination folder path as an array. Empty = root. Created as
+    /// needed. All listed notes land here.
+    #[serde(default)]
+    pub folder: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveFolderArgs {
+    /// The folder subtree to move, e.g. `["gometro"]`. Every note whose
+    /// path starts with this is moved. Must be non-empty.
+    pub from: Vec<String>,
+    /// The new path prefix, e.g. `["consulting","oldclients","gometro"]`.
+    /// Can change depth/parent, not just rename in place. Empty = move the
+    /// subtree to the root.
+    #[serde(default)]
+    pub to: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -186,6 +224,27 @@ fn meta_json(m: &NoteMeta) -> Value {
     })
 }
 
+/// `meta_json` restricted to a projection. `id` is always kept; an empty /
+/// absent field set means "all fields" (full `meta_json`).
+fn meta_json_proj(m: &NoteMeta, fields: Option<&[String]>) -> Value {
+    let Some(fields) = fields else {
+        return meta_json(m);
+    };
+    let mut o = serde_json::Map::new();
+    o.insert("id".into(), json!(m.id));
+    for f in fields {
+        match f.as_str() {
+            "title" => o.insert("title".into(), json!(m.title)),
+            "folder" => o.insert("folder".into(), json!(m.folder)),
+            "created" => o.insert("created".into(), json!(m.created)),
+            "modified" => o.insert("modified".into(), json!(m.modified)),
+            "private" => o.insert("private".into(), json!(m.private)),
+            _ => None,
+        };
+    }
+    Value::Object(o)
+}
+
 fn todo_json(t: &Todo) -> Value {
     json!({ "id": t.id, "text": t.text, "order": t.order, "created": t.created })
 }
@@ -244,19 +303,91 @@ impl Ccal {
     }
 
     #[tool(description = "List notes (id, title, folder, timestamps) without \
-        their bodies. Optionally scoped to a folder and its subfolders.")]
+        their bodies. Optionally scoped to a folder and its subfolders, \
+        paginated (`limit`/`offset`) and projected (`fields`). Results are \
+        ordered by folder, then title, then id, so paging is stable. \
+        Returns `{ notes, total, offset, limit }` where `total` is the \
+        match count before paging. On a big corpus, call `list_folders` \
+        first to see structure, then page this with a `folder` scope.")]
     async fn list_notes(
         &self,
         Parameters(args): Parameters<ListNotesArgs>,
     ) -> Result<CallToolResult, McpError> {
         let metas = self.doc.store.lock().await.note_metas();
         let prefix = args.folder.unwrap_or_default();
-        let out: Vec<Value> = metas
-            .iter()
+        let mut hits: Vec<NoteMeta> = metas
+            .into_iter()
             .filter(|m| m.folder.len() >= prefix.len() && m.folder[..prefix.len()] == prefix[..])
-            .map(meta_json)
             .collect();
-        ok(json!({ "notes": out }))
+        hits.sort_by(|a, b| {
+            a.folder
+                .cmp(&b.folder)
+                .then_with(|| a.title.cmp(&b.title))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let total = hits.len();
+        let offset = args.offset.unwrap_or(0).min(total);
+        let end = match args.limit {
+            Some(l) => (offset + l).min(total),
+            None => total,
+        };
+        let fields = args.fields.as_deref();
+        let out: Vec<Value> = hits[offset..end]
+            .iter()
+            .map(|m| meta_json_proj(m, fields))
+            .collect();
+        ok(json!({
+            "notes": out,
+            "total": total,
+            "offset": offset,
+            "limit": args.limit,
+        }))
+    }
+
+    #[tool(description = "The derived folder tree with note counts — the \
+        cheap way to answer \"what folders do I have?\" without fetching \
+        every note. Returns `{ folders: [{ path, direct, subtree }] }`: \
+        `direct` = notes filed exactly there, `subtree` = notes there or \
+        anywhere below. Parent folders with no direct notes are still \
+        listed; root notes appear as path `[]`. Sorted by path.")]
+    async fn list_folders(&self) -> Result<CallToolResult, McpError> {
+        let tree = self.doc.store.lock().await.folder_tree();
+        let out: Vec<Value> = tree
+            .iter()
+            .map(|(p, d, s)| json!({ "path": p, "direct": d, "subtree": s }))
+            .collect();
+        ok(json!({ "folders": out }))
+    }
+
+    #[tool(description = "Move many notes to one folder in a SINGLE \
+        transaction (one change, one sync, one undo unit). Vastly cheaper \
+        than calling move_note per id. Unknown ids are skipped. Returns \
+        `{ moved: N }`.")]
+    async fn move_notes(
+        &self,
+        Parameters(args): Parameters<MoveNotesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let n = self
+            .mutate(|st| st.move_notes(&args.ids, &args.folder))
+            .await?;
+        ok(json!({ "moved": n }))
+    }
+
+    #[tool(description = "Move/rename a whole folder subtree in one \
+        transaction: every note whose path starts with `from` has that \
+        prefix replaced by `to`. Unlike rename_folder this can re-parent \
+        and change depth (e.g. [\"gometro\"] -> \
+        [\"consulting\",\"oldclients\",\"gometro\"]). This is the \
+        intent-level tool for \"move these folders\" — no need to \
+        enumerate ids. Returns `{ moved: N }`.")]
+    async fn move_folder(
+        &self,
+        Parameters(args): Parameters<MoveFolderArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let n = self
+            .mutate(|st| st.move_folder(&args.from, &args.to))
+            .await?;
+        ok(json!({ "moved": n }))
     }
 
     #[tool(description = "Full-text search across all notes (title, folder \

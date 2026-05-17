@@ -285,6 +285,40 @@ impl Store {
             .collect()
     }
 
+    /// The derived folder tree with note counts — answers "what folders do
+    /// I have?" in one call, without shipping every note record. For each
+    /// distinct folder path that appears (every note's path *and every
+    /// ancestor prefix* of it, so parent folders with no direct notes still
+    /// show up), `direct` is notes filed exactly there and `subtree` is
+    /// notes there or anywhere below. Root notes (empty path) are reported
+    /// as path `[]`. Sorted lexicographically by path. Body-free.
+    pub fn folder_tree(&self) -> Vec<(Vec<String>, usize, usize)> {
+        use std::collections::BTreeMap;
+        let mut direct: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+        let mut subtree: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+        for m in self.note_metas() {
+            *direct.entry(m.folder.clone()).or_default() += 1;
+            // Count this note against every ancestor prefix (1..=len);
+            // the empty-root prefix is tracked via `direct[[]]` only.
+            for k in 1..=m.folder.len() {
+                *subtree.entry(m.folder[..k].to_vec()).or_default() += 1;
+            }
+        }
+        let mut paths: std::collections::BTreeSet<Vec<String>> =
+            subtree.keys().cloned().collect();
+        paths.extend(direct.keys().cloned());
+        paths
+            .into_iter()
+            .map(|p| {
+                let d = direct.get(&p).copied().unwrap_or(0);
+                // A leaf folder has no subtree entry of its own; its
+                // subtree total is just its direct count.
+                let s = subtree.get(&p).copied().unwrap_or(d).max(d);
+                (p, d, s)
+            })
+            .collect()
+    }
+
     fn read_note(&self, id: &str) -> Option<Note> {
         let obj = child(&self.doc, &self.notes, id)?;
         Some(Note {
@@ -418,6 +452,75 @@ impl Store {
                 if folder.len() > depth && folder[..path.len()] == *path {
                     let mut nf = folder;
                     nf[depth] = new_name.to_string();
+                    Some((id, nf))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let ts = now_ms();
+        let mut tx = self.doc.transaction();
+        for (id, nf) in &updates {
+            let Some((Value::Object(_), obj)) = tx.get(&self.notes, id.as_str())? else {
+                continue;
+            };
+            let list = tx.put_object(&obj, "folder", ObjType::List)?;
+            for (i, c) in nf.iter().enumerate() {
+                tx.insert(&list, i, c.as_str())?;
+            }
+            tx.put(&obj, "modified", ts)?;
+        }
+        commit(tx);
+        Ok(updates.len())
+    }
+
+    /// Move many notes to one destination folder in a **single
+    /// transaction** (one change, one sync broadcast, one undo unit —
+    /// unlike N separate `set_note_folder` calls). Unknown ids are skipped;
+    /// returns how many notes actually moved.
+    pub fn move_notes(&mut self, ids: &[String], folder: &[String]) -> Result<usize> {
+        let ts = now_ms();
+        let mut tx = self.doc.transaction();
+        let mut moved = 0;
+        for id in ids {
+            let Some((Value::Object(_), obj)) = tx.get(&self.notes, id.as_str())? else {
+                continue;
+            };
+            let list = tx.put_object(&obj, "folder", ObjType::List)?;
+            for (i, c) in folder.iter().enumerate() {
+                tx.insert(&list, i, c.as_str())?;
+            }
+            tx.put(&obj, "modified", ts)?;
+            moved += 1;
+        }
+        commit(tx);
+        Ok(moved)
+    }
+
+    /// Move/rename a whole folder *subtree*: every note whose path begins
+    /// with `from` has that prefix replaced by `to`. Unlike
+    /// [`Store::rename_folder`] (which only renames the final component
+    /// in place) this can change depth and re-parent — e.g.
+    /// `["gometro"]` → `["consulting","oldclients","gometro"]`. One
+    /// transaction; bodies untouched so concurrent edits still merge.
+    /// Returns the number of notes updated. `from` must be non-empty
+    /// (the root is not a movable folder).
+    pub fn move_folder(&mut self, from: &[String], to: &[String]) -> Result<usize> {
+        if from.is_empty() {
+            return Err(anyhow!("cannot move the root folder"));
+        }
+        let updates: Vec<(String, Vec<String>)> = self
+            .doc
+            .keys(&self.notes)
+            .filter_map(|id| {
+                let obj = child(&self.doc, &self.notes, &id)?;
+                let folder = get_folder(&self.doc, &obj);
+                if folder.len() >= from.len() && folder[..from.len()] == *from {
+                    let mut nf = to.to_vec();
+                    nf.extend_from_slice(&folder[from.len()..]);
                     Some((id, nf))
                 } else {
                     None
@@ -617,19 +720,26 @@ impl Store {
     /// by checkpoint restore and arbitrary-point ("time-travel") restore;
     /// `preview_*` use the report, `restore_*` apply the plan.
     fn plan_restore_to(&self, heads: &[ChangeHash]) -> Result<RestorePlan> {
-        // `fork_at` materializes the document exactly as it was at those
-        // heads (history is never pruned, so the hashes are always
-        // reachable once synced). Read-only — we never mutate the fork.
-        let snap = self
-            .doc
-            .fork_at(heads)
-            .context("forking document at the target heads")?;
-        let target_notes = obj_at(&snap, "notes")
-            .map(|o| all_notes(&snap, &o))
-            .unwrap_or_default();
-        let target_todos = obj_at(&snap, "todos")
-            .map(|o| all_todos(&snap, &o))
-            .unwrap_or_default();
+        // Read the past state with Automerge's clock-based `*_at` API
+        // instead of `fork_at`. `fork_at`/`get_changes` reconstruct changes
+        // from the op-set and `unwrap()` an internal `MissingOps` error
+        // when the op range has holes (normal after sync/merge) — an
+        // upstream 0.7.x panic. The `*_at` reads walk the live op-set under
+        // a vector clock derived from `heads`: no reconstruction, no panic,
+        // and no document clone. `notes`/`todos` are genesis objects so
+        // their ids are valid at any point in history.
+        //
+        // Guard first: unknown heads would make every `*_at` read empty and
+        // a restore would then *delete the entire corpus*. Refuse instead.
+        for h in heads {
+            if self.doc.get_change_meta_by_hash(h).is_none() {
+                return Err(anyhow!(
+                    "restore target {h} is not in local history yet (sync first)"
+                ));
+            }
+        }
+        let target_notes = all_notes_at(&self.doc, &self.notes, heads);
+        let target_todos = all_todos_at(&self.doc, &self.todos, heads);
         let live_notes = all_notes(&self.doc, &self.notes);
         let live_todos = all_todos(&self.doc, &self.todos);
 
@@ -815,17 +925,24 @@ impl Store {
                 }
             }
         }
+        // `get_changes_meta` reads ONLY the change graph — it does not
+        // reconstruct ops, so it sidesteps the upstream 0.7.x `MissingOps`
+        // panic that `get_changes` hits once history has merge holes.
         let mut rows: Vec<HistoryRow> = self
             .doc
-            .get_changes(&[])
+            .get_changes_meta(&[])
             .into_iter()
             .map(|c| {
-                let hash = c.hash().to_string();
-                let secs = c.timestamp();
+                let hash = c.hash.to_string();
+                let ops = if c.max_op >= c.start_op {
+                    (c.max_op - c.start_op + 1) as usize
+                } else {
+                    0
+                };
                 HistoryRow {
-                    ts: if secs > 0 { secs * 1000 } else { 0 },
-                    ops: c.len(),
-                    actor: c.actor_id().to_string().chars().take(8).collect(),
+                    ts: if c.timestamp > 0 { c.timestamp * 1000 } else { 0 },
+                    ops,
+                    actor: c.actor.to_string().chars().take(8).collect(),
                     checkpoint: marks.get(&hash).cloned(),
                     hash,
                 }
@@ -918,13 +1035,106 @@ fn ensure_map<T: Transactable>(tx: &mut T, key: &str) -> Result<ObjId> {
     Ok(tx.put_object(ROOT, key, ObjType::Map)?)
 }
 
-/// Resolve a `ROOT`-level container in any document (used to read a
-/// `fork_at` snapshot, which has its own ObjIds but the same key layout).
-fn obj_at<D: ReadDoc>(d: &D, key: &str) -> Option<ObjId> {
-    match d.get(ROOT, key) {
+// ---- "as at heads" helpers -----------------------------------------------
+//
+// Mirror the live readers above but go through Automerge's clock-based
+// `*_at` API, so `plan_restore_to` can read a past state WITHOUT `fork_at`
+// (which panics on the upstream `MissingOps` bug). Same shapes, just with a
+// `heads` clock threaded through.
+
+fn child_at<D: ReadDoc>(d: &D, parent: &ObjId, key: &str, h: &[ChangeHash]) -> Option<ObjId> {
+    match d.get_at(parent, key, h) {
         Ok(Some((Value::Object(_), id))) => Some(id),
         _ => None,
     }
+}
+
+fn str_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> String {
+    match d.get_at(obj, key, h) {
+        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+            ScalarValue::Str(s) => s.to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn i64_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> i64 {
+    match d.get_at(obj, key, h) {
+        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+            ScalarValue::Int(i) => *i,
+            ScalarValue::Uint(u) => *u as i64,
+            ScalarValue::Timestamp(t) => *t,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn f64_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> f64 {
+    match d.get_at(obj, key, h) {
+        Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+            ScalarValue::F64(f) => *f,
+            ScalarValue::Int(i) => *i as f64,
+            _ => 0.0,
+        },
+        _ => 0.0,
+    }
+}
+
+fn bool_at<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, h: &[ChangeHash]) -> bool {
+    match d.get_at(obj, key, h) {
+        Ok(Some((Value::Scalar(s), _))) => matches!(s.as_ref(), ScalarValue::Boolean(true)),
+        _ => false,
+    }
+}
+
+fn folder_at<D: ReadDoc>(d: &D, note_obj: &ObjId, h: &[ChangeHash]) -> Vec<String> {
+    let Some(list) = child_at(d, note_obj, "folder", h) else {
+        return Vec::new();
+    };
+    (0..d.length_at(&list, h))
+        .filter_map(|i| match d.get_at(&list, i, h) {
+            Ok(Some((Value::Scalar(s), _))) => match s.as_ref() {
+                ScalarValue::Str(s) => Some(s.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn all_notes_at<D: ReadDoc>(d: &D, notes: &ObjId, h: &[ChangeHash]) -> Vec<Note> {
+    d.keys_at(notes, h)
+        .filter_map(|id| {
+            let obj = child_at(d, notes, &id, h)?;
+            Some(Note {
+                id,
+                title: str_at(d, &obj, "title", h),
+                folder: folder_at(d, &obj, h),
+                body: child_at(d, &obj, "body", h)
+                    .and_then(|b| d.text_at(&b, h).ok())
+                    .unwrap_or_default(),
+                created: i64_at(d, &obj, "created", h),
+                modified: i64_at(d, &obj, "modified", h),
+                private: bool_at(d, &obj, "private", h),
+            })
+        })
+        .collect()
+}
+
+fn all_todos_at<D: ReadDoc>(d: &D, todos: &ObjId, h: &[ChangeHash]) -> Vec<Todo> {
+    d.keys_at(todos, h)
+        .filter_map(|id| {
+            let o = child_at(d, todos, &id, h)?;
+            Some(Todo {
+                id,
+                text: str_at(d, &o, "text", h),
+                order: f64_at(d, &o, "order", h),
+                created: i64_at(d, &o, "created", h),
+            })
+        })
+        .collect()
 }
 
 /// Materialize one note (body included) from an arbitrary doc — mirrors
@@ -1059,6 +1269,63 @@ mod tests {
 
         sync(&mut a, &mut b);
         assert_eq!(b.note(&n2).map(|n| n.folder), Some(s(&["job", "proj"])));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bulk_move_folder_tree_and_sync() {
+        let dir = std::env::temp_dir().join(format!("ccal-bulktest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let n1 = a.create_note(&s(&["gometro"]), "g1").unwrap();
+        let n2 = a.create_note(&s(&["gometro", "specs"]), "g2").unwrap();
+        let n3 = a.create_note(&s(&["texecom"]), "t1").unwrap();
+        let root = a.create_note(&[], "loose").unwrap();
+
+        // folder_tree: parent prefixes appear; direct vs subtree counts.
+        let tree = a.folder_tree();
+        let find = |p: &[&str]| {
+            tree.iter()
+                .find(|(path, _, _)| *path == s(p))
+                .map(|(_, d, st)| (*d, *st))
+        };
+        assert_eq!(find(&[]), Some((1, 1))); // the root note
+        assert_eq!(find(&["gometro"]), Some((1, 2))); // 1 direct, 2 in subtree
+        assert_eq!(find(&["gometro", "specs"]), Some((1, 1)));
+        assert_eq!(find(&["texecom"]), Some((1, 1)));
+
+        // move_folder re-parents the whole subtree (depth change).
+        let moved = a
+            .move_folder(&s(&["gometro"]), &s(&["consulting", "old", "gometro"]))
+            .unwrap();
+        assert_eq!(moved, 2);
+        assert_eq!(a.note(&n1).unwrap().folder, s(&["consulting", "old", "gometro"]));
+        assert_eq!(
+            a.note(&n2).unwrap().folder,
+            s(&["consulting", "old", "gometro", "specs"])
+        );
+        assert_eq!(a.note(&n3).unwrap().folder, s(&["texecom"])); // untouched
+
+        // move_notes: many ids, one destination, unknown id skipped.
+        let n = a
+            .move_notes(
+                &[n3.clone(), root.clone(), "no-such-id".to_string()],
+                &s(&["archive"]),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(a.note(&n3).unwrap().folder, s(&["archive"]));
+        assert_eq!(a.note(&root).unwrap().folder, s(&["archive"]));
+
+        sync(&mut a, &mut b);
+        assert_eq!(
+            b.note(&n2).map(|n| n.folder),
+            Some(s(&["consulting", "old", "gometro", "specs"]))
+        );
+        assert_eq!(b.note(&root).map(|n| n.folder), Some(s(&["archive"])));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

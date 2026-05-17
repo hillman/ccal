@@ -1,6 +1,56 @@
 # CCAL Reborn
 
-A terminal UI for notes, todo and some basic calendar stuff.  Also has a sync server based on autosync.
+A fast terminal app for **markdown notes and todos** with **offline-first,
+multi-device sync** (Automerge CRDT) and an **optional MCP server** that lets
+an LLM assistant help organise your notes — safely. Single static Rust
+binary, no runtime dependencies. (Light calendar bits are planned; the
+calendar is deliberately secondary.)
+
+## Features
+
+- **Notes & todos in a terminal.** Markdown notes in a folder tree and an
+  ordered, reorderable todo list, in a snappy [ratatui](https://ratatui.rs)
+  UI. One static binary, nothing to install alongside it.
+- **Folders are derived, not managed.** A note's folder is just its path —
+  create, move and rename folders implicitly by filing notes; folder rename
+  rewrites a whole subtree at once. No empty-folder bookkeeping.
+- **Vim note editor.** Modal editing via [edtui](https://github.com/preiter93/edtui)
+  with markdown syntax highlighting; app keys only fire in Normal mode, so
+  typing never triggers a command.
+- **Offline-first sync, no conflicts.** The store *is* a CRDT (Automerge):
+  every device works fully offline and converges automatically, with
+  **character-level merge** of concurrent edits to the same note — edits
+  are never lost and there are no conflict markers.
+- **Run-your-own sync server.** `ccal-server` is a tiny always-on peer:
+  point any number of clients at it; it merges, **rebroadcasts changes
+  live**, and doubles as a free plaintext backup. No database, no schema,
+  no migrations. Built to sit behind Tailscale (still bearer-token gated).
+  The wire protocol is language-neutral (raw Automerge sync messages) so a
+  future iOS client speaks it unchanged.
+- **Optional MCP server for LLM assistants.** Opt-in, embedded in
+  `ccal-server` over HTTP. Claude (or any MCP client) can list, search,
+  read, create, edit, move, rename and delete notes & todos — 18 tools —
+  and because the edits ride the same sync broadcast, they appear **live**
+  in every open ccal client.
+- **Checkpoints & time-travel.** Automerge keeps the whole history, so
+  snapshots are essentially free. Create named checkpoints; roll the whole
+  corpus back to any checkpoint *or any point in the edit log*. Restore is
+  itself a forward change, so it syncs cleanly to every device. A
+  **History tab** browses the timeline and previews exactly what a restore
+  would change before you commit to it.
+- **Private notes.** Mark a note private to hide its body from the LLM
+  (reads redacted, body-edits refused, never matched by search) while
+  still letting it rename/move/organise around it. Enforced at the MCP
+  boundary — your own devices still see everything; nothing is encrypted,
+  and the assistant can't un-private a note.
+- **Full-text search.** `/` searches titles, folder paths and bodies
+  live; the assistant gets the same as a privacy-respecting `search_notes`
+  tool.
+- **Bear import.** One-shot `import-bear` reads the Bear app's SQLite
+  read-only and maps nested tags to nested folders.
+- **Configure your way.** Optional TOML config or `CCAL_*` env vars (env
+  wins) with sensible defaults; no config at all = standalone, same code
+  path.
 
 ## Why?
 
@@ -8,7 +58,7 @@ Way back in the day, when I was at university, myself and a friend made a curses
 
 It's for notes, todos and (not implemented yet) calendar stuff.  Despite the name, the calendar bit is actually secondary and will really just be about pulling in today's events from other calendars and having timed todos.  It isn't a fully fledged calendar.
 
-I've built in Rust for nice quick UI and easy executable builds.  It's using automerge as a CRDT/protocol for storage, so I can add a simple sync server (not done yet).
+I've built it in Rust for a nice quick UI and easy executable builds.  It uses Automerge as both the storage format and the sync protocol, which is what makes the self-hosted sync server (and the live LLM integration) work.
 
 ## Editor
 
@@ -16,7 +66,7 @@ It's using edtui for the note editor - that uses vim bindings, because I love vi
 
 
 ## Sync
-Automerge is the storage format and the sync protocol - it's designed for offline first distributed synchronisation.  There will be a sync peer you can run on your own machine and that can be used to sync clients - they all just point to that.  This is intended to be used behind tailscale, so the server doesn't implement encryption or auth, you just let tailscale do that.
+Automerge is both the storage format and the sync protocol — it's designed for offline-first distributed synchronisation. `ccal-server` is a small always-on **peer** you run on your own machine: clients all point at it, it merges everything server-side, rebroadcasts so other connected clients converge live, and acts as a free plaintext backup of the whole corpus. No database, no schema, no migrations. It's intended to run behind Tailscale, so the server itself doesn't do transport encryption — you let Tailscale do that — though a bearer token is still checked at the handshake regardless.
 
 ### Config file
 
@@ -49,7 +99,7 @@ token = "a-long-random-string"
 addr = "0.0.0.0:9000"
 ```
 
-### MCP server (optional)
+## MCP server (optional)
 
 `ccal-server` can expose an [MCP](https://modelcontextprotocol.io) server so
 an LLM coding assistant can list, read, create, edit, move, rename and
@@ -78,6 +128,11 @@ claude mcp add --transport http ccal http://your-server:8787/mcp \
 `mcp_doc` (default `ccal`, env `CCAL_MCP_DOC`) picks which docid it edits —
 keep it equal to the docid your clients sync (the last path segment of the
 client `url`).
+
+## Checkpoints, history & privacy
+
+These work whether or not you use the MCP server, but they're what makes
+letting an assistant loose on your notes safe.
 
 **Checkpoints / undo.** Because Automerge keeps the whole history anyway, a
 checkpoint is basically free — just a label plus the document heads at that
