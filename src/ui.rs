@@ -11,7 +11,7 @@ use ratatui::{
 
 use chrono::Local;
 
-use crate::app::{App, Entry, Mode, Prompt, Tab};
+use crate::app::{App, Entry, Mode, Preview, Prompt, Tab};
 
 pub fn draw(f: &mut Frame, app: &App) {
     // While taking text input, grow the bottom strip to two rows so a dim
@@ -100,7 +100,60 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// One row for a folder/note entry. `dim` greys it out — used in the
+/// non-interactive folder preview so it reads as context, not a selection.
+fn entry_item(e: &Entry, dim: bool) -> ListItem<'static> {
+    match e {
+        Entry::Dir(name) => {
+            let mut s = Style::default().fg(if dim { Color::DarkGray } else { Color::Blue });
+            if !dim {
+                s = s.add_modifier(Modifier::BOLD);
+            }
+            ListItem::new(Span::styled(format!("📁 {name}/"), s))
+        }
+        Entry::Note { title, private, .. } => {
+            if *private {
+                ListItem::new(Span::styled(
+                    format!("  🔒 {title}"),
+                    Style::default().fg(if dim { Color::DarkGray } else { Color::Yellow }),
+                ))
+            } else if dim {
+                ListItem::new(Span::styled(
+                    format!("  📄 {title}"),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            } else {
+                ListItem::new(format!("  📄 {title}"))
+            }
+        }
+    }
+}
+
 fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
+    // Search collapses folders to a flat cross-corpus hit list — a
+    // navigation preview makes no sense there, so keep it single-pane.
+    if let Mode::Search { query } = &app.mode {
+        let items: Vec<ListItem> = app.entries.iter().map(|e| entry_item(e, false)).collect();
+        let title =
+            format!(" Search “{}”  ({} hits · Esc cancel) ", query, app.entries.len());
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("> ");
+        let mut state = ListState::default();
+        if !app.entries.is_empty() {
+            state.select(Some(app.entry_sel));
+        }
+        f.render_stateful_widget(list, area, &mut state);
+        return;
+    }
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    // --- Left: the navigable list of the current folder ---------------
     let flat = app.flat_list();
     let mut items: Vec<ListItem> = Vec::new();
     if !flat {
@@ -109,35 +162,11 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Blue),
         )));
     }
-    for e in &app.entries {
-        items.push(match e {
-            Entry::Dir(name) => ListItem::new(Span::styled(
-                format!("📁 {name}/"),
-                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-            )),
-            Entry::Note { title, private, .. } => {
-                if *private {
-                    ListItem::new(Span::styled(
-                        format!("  🔒 {title}"),
-                        Style::default().fg(Color::Yellow),
-                    ))
-                } else {
-                    ListItem::new(format!("  📄 {title}"))
-                }
-            }
-        });
-    }
+    items.extend(app.entries.iter().map(|e| entry_item(e, false)));
 
-    let title = if let Mode::Search { query } = &app.mode {
-        format!(" Search “{}”  ({} hits · Esc cancel) ", query, app.entries.len())
-    } else {
-        let crumb = if flat {
-            "/".to_string()
-        } else {
-            format!("/{}", app.cur.join("/"))
-        };
-        format!(" Notes {crumb}  (n new · R rename · m move · p priv · d del · / search · r reload) ")
-    };
+    let crumb = if flat { "/".to_string() } else { format!("/{}", app.cur.join("/")) };
+    let title =
+        format!(" Notes {crumb}  (n new · R rename · m move · p priv · d del · / search · r reload) ");
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -147,7 +176,61 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
     if rows > 0 {
         state.select(Some(app.entry_sel));
     }
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, panes[0], &mut state);
+
+    // --- Right: context preview of whatever is selected --------------
+    match &app.preview {
+        Preview::Folder { path, entries } => {
+            let title = format!(" /{} ", path.join("/"));
+            if entries.is_empty() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "  (empty)",
+                        Style::default().fg(Color::DarkGray),
+                    )))
+                    .block(Block::default().borders(Borders::ALL).title(title)),
+                    panes[1],
+                );
+            } else {
+                let items: Vec<ListItem> =
+                    entries.iter().map(|e| entry_item(e, true)).collect();
+                f.render_widget(
+                    List::new(items)
+                        .block(Block::default().borders(Borders::ALL).title(title)),
+                    panes[1],
+                );
+            }
+        }
+        Preview::Note { title, body, private } => {
+            let lock = if *private { "🔒 " } else { "" };
+            let text = if body.trim().is_empty() {
+                Paragraph::new(Line::from(Span::styled(
+                    "  (empty note)",
+                    Style::default().fg(Color::DarkGray),
+                )))
+            } else {
+                Paragraph::new(body.as_str())
+            };
+            f.render_widget(
+                text.wrap(ratatui::widgets::Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {lock}{title} ")),
+                ),
+                panes[1],
+            );
+        }
+        Preview::None => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  ↑↓ to browse · → / Enter to open",
+                    Style::default().fg(Color::DarkGray),
+                )))
+                .block(Block::default().borders(Borders::ALL).title(" Preview ")),
+                panes[1],
+            );
+        }
+    }
 }
 
 /// Compact "time ago" for the history timeline. `ms == 0` → unknown (a

@@ -54,6 +54,18 @@ pub enum Entry {
     Note { id: String, title: String, private: bool },
 }
 
+/// What the right-hand pane of the Notes tab shows for the current
+/// selection. Recomputed (cheaply) after any selection/navigation change
+/// so `ui` stays a pure reader. Only ever populated on the Notes tab in
+/// Normal mode — search/edit/other tabs leave it `None`.
+pub enum Preview {
+    None,
+    /// A folder is selected on the left: list what's inside it.
+    Folder { path: Vec<String>, entries: Vec<Entry> },
+    /// A note is selected on the left: show its body.
+    Note { title: String, body: String, private: bool },
+}
+
 pub struct App {
     /// Shared with the background sync thread (if any). The lock is held
     /// only for individual store calls — never across a redraw or IO.
@@ -76,6 +88,8 @@ pub struct App {
     pub cur: Vec<String>,
     pub entries: Vec<Entry>,
     pub entry_sel: usize,
+    /// Right-pane preview for the current Notes selection (see [`Preview`]).
+    pub preview: Preview,
     pub editor: EditorState,
     /// Persisted across keystrokes — holds multi-key Vim state (e.g. `dd`).
     edit_events: EditorEventHandler,
@@ -138,6 +152,7 @@ impl App {
             cur: Vec::new(),
             entries: Vec::new(),
             entry_sel: 0,
+            preview: Preview::None,
             editor: EditorState::new(Lines::default()),
             edit_events: EditorEventHandler::default(),
             search_index: Vec::new(),
@@ -262,6 +277,7 @@ impl App {
         { let subs = self.st().calendars(); self.cal_subs = subs; }
         self.entries = self.build_entries();
         self.clamp();
+        self.update_preview();
     }
 
     /// Reload the document from disk (picks up an external `import-bear`).
@@ -318,14 +334,21 @@ impl App {
                 .collect();
         }
 
+        self.children_of(&self.cur)
+    }
+
+    /// Folders-then-notes entries directly inside `folder` (one level
+    /// deep). Drives both the navigable left pane (via `build_entries`)
+    /// and the folder preview on the right.
+    fn children_of(&self, folder: &[String]) -> Vec<Entry> {
         let notes = self.st().note_metas();
-        let depth = self.cur.len();
+        let depth = folder.len();
         let mut dirs: Vec<String> = Vec::new();
         let mut here: Vec<&NoteMeta> = Vec::new();
         for n in &notes {
-            if n.folder.len() == depth && n.folder == self.cur {
+            if n.folder.len() == depth && n.folder == folder {
                 here.push(n);
-            } else if n.folder.len() > depth && n.folder[..depth] == self.cur[..] {
+            } else if n.folder.len() > depth && n.folder[..depth] == *folder {
                 let name = n.folder[depth].clone();
                 if !dirs.contains(&name) {
                     dirs.push(name);
@@ -342,6 +365,34 @@ impl App {
             private: n.private,
         }));
         out
+    }
+
+    /// Recompute the right-pane preview for the current Notes selection.
+    /// Called after every key (post-clamp) and after a refresh, so the
+    /// preview always tracks `entry_sel`/`cur`. Cheap: a folder preview is
+    /// one `note_metas()` scan, a note preview one note read.
+    fn update_preview(&mut self) {
+        if self.tab != Tab::Notes || !matches!(self.mode, Mode::Normal) {
+            self.preview = Preview::None;
+            return;
+        }
+        self.preview = match self.selected().cloned() {
+            Some(Entry::Dir(name)) => {
+                let mut path = self.cur.clone();
+                path.push(name);
+                let entries = self.children_of(&path);
+                Preview::Folder { path, entries }
+            }
+            Some(Entry::Note { id, .. }) => match self.st().note(&id) {
+                Some(n) => Preview::Note {
+                    title: if n.title.is_empty() { "(untitled)".into() } else { n.title },
+                    body: n.body,
+                    private: n.private,
+                },
+                None => Preview::None,
+            },
+            None => Preview::None, // the ".." row
+        };
     }
 
     fn at_root(&self) -> bool {
@@ -381,6 +432,7 @@ impl App {
             Mode::Search { .. } => self.search_key(key)?,
         }
         self.clamp();
+        self.update_preview();
         Ok(())
     }
 
