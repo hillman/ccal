@@ -387,7 +387,9 @@ impl App {
     /// preview always tracks `entry_sel`/`cur`. Cheap: a folder preview is
     /// one `note_metas()` scan, a note preview one note read.
     fn update_preview(&mut self) {
-        if self.tab != Tab::Notes || !matches!(self.mode, Mode::Normal) {
+        if self.tab != Tab::Notes
+            || !matches!(self.mode, Mode::Normal | Mode::Search { .. })
+        {
             self.preview = Preview::None;
             return;
         }

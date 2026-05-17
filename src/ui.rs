@@ -130,8 +130,13 @@ fn entry_item(e: &Entry, dim: bool) -> ListItem<'static> {
 }
 
 fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
-    // Search collapses folders to a flat cross-corpus hit list — a
-    // navigation preview makes no sense there, so keep it single-pane.
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    // Search collapses folders to a flat cross-corpus hit list, but the
+    // selected hit still gets a preview pane like normal navigation.
     if let Mode::Search { query } = &app.mode {
         let items: Vec<ListItem> = app.entries.iter().map(|e| entry_item(e, false)).collect();
         let title =
@@ -144,14 +149,10 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
         if !app.entries.is_empty() {
             state.select(Some(app.entry_sel));
         }
-        f.render_stateful_widget(list, area, &mut state);
+        f.render_stateful_widget(list, panes[0], &mut state);
+        draw_preview(f, app, panes[1]);
         return;
     }
-
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(area);
 
     // --- Left: the navigable list of the current folder ---------------
     let flat = app.flat_list();
@@ -179,6 +180,12 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, panes[0], &mut state);
 
     // --- Right: context preview of whatever is selected --------------
+    draw_preview(f, app, panes[1]);
+}
+
+/// Render the right-hand context preview for the current selection.
+/// Shared by normal folder navigation and the search hit list.
+fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
     match &app.preview {
         Preview::Folder { path, entries } => {
             let title = format!(" /{} ", path.join("/"));
@@ -189,7 +196,7 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     )))
                     .block(Block::default().borders(Borders::ALL).title(title)),
-                    panes[1],
+                    area,
                 );
             } else {
                 let items: Vec<ListItem> =
@@ -197,7 +204,7 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
                 f.render_widget(
                     List::new(items)
                         .block(Block::default().borders(Borders::ALL).title(title)),
-                    panes[1],
+                    area,
                 );
             }
         }
@@ -217,7 +224,7 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
                         .borders(Borders::ALL)
                         .title(format!(" {lock}{title} ")),
                 ),
-                panes[1],
+                area,
             );
         }
         Preview::None => {
@@ -227,7 +234,7 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )))
                 .block(Block::default().borders(Borders::ALL).title(" Preview ")),
-                panes[1],
+                area,
             );
         }
     }
