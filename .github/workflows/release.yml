@@ -4,11 +4,12 @@ name: release
 #   1. Push a version tag → publish a public GitHub Release.
 #        git tag v0.1.0 && git push origin v0.1.0
 #   2. Actions tab → "release" → "Run workflow" (manual / workflow_dispatch):
-#        - leave "tag" empty   → just build, upload a run artifact (no Release)
+#        - leave "tag" empty   → just build, upload run artifacts (no Release)
 #        - set  "tag" e.g. v0.1.0 → build AND publish that Release/tag
 #
-# Note: the manual "Run workflow" button only appears once this file is on
-# the default branch AND Actions is enabled in repo Settings → Actions.
+# Builds macOS (Apple Silicon) and Linux (x86_64) binaries — one matrix leg
+# per platform, both native (no cross-compilation), both uploading to the
+# same Release/run.
 #
 # The binaries are unsigned: see the quarantine note in the release body.
 on:
@@ -18,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create & publish (empty = build artifact only, no Release)"
+        description: "Release tag to create & publish (empty = build artifacts only, no Release)"
         required: false
         default: ""
 
@@ -26,18 +27,28 @@ permissions:
   contents: write # needed to create the Release and upload assets
 
 jobs:
-  macos:
-    name: build (aarch64-apple-darwin)
-    # macos-14 runners are Apple Silicon, so the default host target already
-    # is aarch64-apple-darwin — no cross-compilation needed.
-    runs-on: macos-14
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 is Apple Silicon; ubuntu-latest is x86_64 — so each
+          # leg's host target is the one we want, no cross-compilation.
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -55,7 +66,7 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
-          echo "Building ${version} (publish release: ${publish})"
+          echo "Building ${version} for ${{ matrix.label }} (publish release: ${publish})"
 
       - name: Build release binaries
         run: cargo build --release --locked --bins
@@ -64,7 +75,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          name="ccal-${{ steps.meta.outputs.version }}-aarch64-apple-darwin"
+          name="ccal-${{ steps.meta.outputs.version }}-${{ matrix.label }}"
           mkdir -p "dist/${name}"
           cp target/release/ccal target/release/ccal-server target/release/import-bear "dist/${name}/"
           cp README.md "dist/${name}/" 2>/dev/null || true
@@ -74,7 +85,9 @@ jobs:
           echo "tarball=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
-      # Tag push, or manual run with a tag supplied → public Release.
+      # Tag push, or manual run with a tag supplied → public Release. Both
+      # matrix legs target the same tag; the action creates it once and
+      # appends each platform's assets.
       - name: Create / update GitHub Release
         if: steps.meta.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
@@ -85,10 +98,12 @@ jobs:
             ${{ steps.package.outputs.checksum }}
           fail_on_unmatched_files: true
           body: |
-            macOS (Apple Silicon / aarch64) build of `ccal`, `ccal-server`, `import-bear`.
+            macOS (Apple Silicon / `aarch64-apple-darwin`) and Linux
+            (`x86_64-unknown-linux-gnu`) builds of `ccal`, `ccal-server`,
+            `import-bear`. Pick the tarball for your platform.
 
-            **These binaries are unsigned.** macOS will quarantine them on
-            first run ("cannot be opened because the developer cannot be
+            **The macOS binaries are unsigned.** macOS will quarantine them
+            on first run ("cannot be opened because the developer cannot be
             verified"). After downloading and extracting:
 
             ```sh
@@ -97,13 +112,13 @@ jobs:
 
             (or right-click each binary in Finder → Open → Open once).
 
-            Verify the download:
+            Verify a download:
 
             ```sh
-            shasum -a 256 -c ${{ steps.package.outputs.name }}.tar.gz.sha256
+            shasum -a 256 -c <file>.tar.gz.sha256
             ```
 
-      # Manual run with no tag → just a downloadable build artifact (login
+      # Manual run with no tag → downloadable build artifacts (login
       # required, expires; good for testing the build without a Release).
       - name: Upload build artifact
         if: steps.meta.outputs.publish != 'true'

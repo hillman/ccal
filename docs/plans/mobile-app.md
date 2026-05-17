@@ -26,6 +26,13 @@ iOS is built and tested).
   and sync loop a second time for no functional gain. `automerge-swift` is
   therefore not used and not relevant — Dioxus links the same `automerge`
   crate the rest of the repo already uses.
+- **Background flush on backgrounding (tier 1 only).** A `beginBackgroundTask`
+  window lets the existing sync thread finish flushing when the app is
+  backgrounded, so a just-captured note reaches the server within seconds
+  without reopening. This is a latency optimisation over the durability
+  guarantee, not a replacement for it. Opportunistic `BGAppRefreshTask`
+  (tier 2) is deferred post-v1; surviving a user force-quit is an explicit
+  non-goal. Full reasoning in the Background sync section.
 - **Tailscale-dependent.** The phone joins the tailnet via the Tailscale iOS
   app; the mobile client speaks plain `ws://` to `ccal-server` exactly like
   the TUI. No TLS, no server change, no reverse proxy. This matches the
@@ -43,61 +50,142 @@ iOS is built and tested).
   `set_note_*` / `todos` / `add_todo`). The mobile app is a new front-end
   over this lib; it never touches the `automerge` crate directly, same rule
   as `app`/`ui`/`sync_client`.
-- The **sync algorithm** in `src/sync_client.rs`: push-everything-owed loop,
-  drain-and-apply loop, exponential backoff, the lock discipline (hold the
-  `Store` lock only across generate/receive/save, never across network IO),
-  and the dirty-flag handoff to the UI. This logic is settled and commented;
-  only its *transport* is ported.
+- The **sync client** `src/sync_client.rs` reused **near-verbatim**: spawned
+  as a `std::thread` running blocking `tungstenite`, talking to
+  `Arc<Mutex<Store>>`, with the existing push/drain loops, exponential
+  backoff, lock discipline (hold the `Store` lock only across
+  generate/receive/save, never across network IO) and the `dirty`/`status`
+  handle the UI polls. This logic is settled and commented; it is not
+  rewritten.
 
-## Refactor required before the app
+## Crate layout (no sync rewrite needed)
 
-`sync_client.rs` is TUI-binary-private and built on **blocking
-`tungstenite` + one `std::thread`** to keep the lib tokio-free. On iOS under
-Dioxus an async WebSocket is the natural fit. The "lib stays tokio-free"
-rule is preserved by keeping the async transport in the *app crate*, not the
-lib — exactly as `ccal-server` keeps tokio in its binary.
+Earlier framing here ("async port required to honour a tokio-free rule")
+was wrong, and is corrected:
 
-1. **Workspace conversion.** Today `ccal` is a single crate. Convert to a
-   Cargo workspace:
-   - `ccal-core` (or keep `ccal` as the lib) — the existing tokio-free lib
-     (`models`, `store`). Unchanged.
-   - `ccal` binaries (TUI, `ccal-server`, `import-bear`) — unchanged, depend
-     on the lib by path.
-   - `ccal-mobile` — new Dioxus crate, depends on the lib by path.
-   This keeps the lib's no-async guarantee intact and lets the mobile crate
-   bring its own async stack without polluting the TUI build.
-2. **Extract the sync loop shape.** Factor the generate/receive/backoff
-   structure out of `sync_client.rs` into something both transports can
-   drive. Two acceptable shapes — pick during implementation:
-   - a small state-machine type in the lib that takes/returns message bytes
-     and has no IO (cleanest; testable; both clients own their socket), or
-   - leave `sync_client.rs` as the desktop impl and write a parallel
-     `mobile_sync` in `ccal-mobile` that mirrors its loop with
-     `tokio-tungstenite`. Less DRY, zero risk to the working TUI.
-   Default to the parallel impl unless the state-machine extraction proves
-   clean — the TUI sync is working and shipped; don't regress it for tidiness.
+- The lib being **sans-IO / tokio-free** is a clean boundary worth keeping —
+  it's *why* this app is cheap (reuse doc + sync, only the process differs).
+  It is orthogonal to sync-vs-async and requires no work to preserve.
+- Dioxus on native/mobile **brings its own async runtime (tokio) anyway**, so
+  a "tokio-free mobile app" was never on the table and must not drive any
+  decision. There is nothing to protect in the mobile crate.
+- Therefore the mobile app **reuses `sync_client.rs` as-is on a
+  `std::thread`**. One blocking sync thread coexists fine alongside Dioxus's
+  runtime. No async port, no state-machine extraction, no constraint to
+  design around. (An async `tokio-tungstenite` port is possible later purely
+  for code aesthetics; it buys nothing functional here — notably *not*
+  background sync, see below — so it is explicitly out of scope.)
+
+Workspace split — still worth doing, for an honest reason: keep Dioxus's
+heavy dependency tree out of the TUI/server build, not to preserve any
+tokio-free guarantee.
+
+- Keep `ccal` as the tokio-free lib (`models`, `store`) — unchanged.
+- TUI / `ccal-server` / `import-bear` binaries — unchanged, depend on the
+  lib by path.
+- `ccal-mobile` — new Dioxus crate, depends on the lib by path, and pulls
+  `sync_client`'s logic in (lift it from binary-private to a shared module,
+  or copy it — it is ~100 lines and stable).
 
 ## Mobile architecture
 
 - **Local replica.** `Store::open_at(<app sandbox>/ccal.automerge)`. On
   iOS that path is the app's Documents/Application Support directory
   (resolve via the platform dirs, not `Store::open`'s desktop default).
-- **Persistence.** Call `Store::save()` after every local mutation and after
-  any merged remote change (mirrors `sync_client.rs` line ~144). On launch,
-  `open_at` reloads the saved blob, so notes captured offline survive and
-  sync later. Genesis-seeding in `Store` already guarantees client/server
-  replicas share an ancestor so first sync converges.
-- **Sync task.** A `tokio` task (not OS thread) running the ported loop
-  against `tokio-tungstenite`, `Authorization: Bearer <token>` header,
-  `ws://<host>:8787/sync/ccal`. Same backoff and status reporting. Store
-  shared with the UI via `Arc<Mutex<Store>>`; lock held only across
-  generate/receive/save.
+- **Persistence.** Call `Store::save()` **synchronously, on the write path,
+  before the UI handler returns** — never debounced or deferred for capture
+  actions. `Store::save()` is already atomic (temp file + rename,
+  `store.rs:118`), so an app kill mid-write cannot corrupt the blob. On
+  launch, `open_at` reloads the saved blob. Genesis-seeding in `Store`
+  guarantees client/server replicas share an ancestor so first sync
+  converges.
+- **Sync thread.** `sync_client.rs` spawned as a `std::thread` (the existing
+  blocking `tungstenite` code, unchanged): `Authorization: Bearer <token>`
+  header, `ws://<host>:8787/sync/ccal`, existing backoff and status
+  reporting. Store shared with the UI via `Arc<Mutex<Store>>`; lock held
+  only across generate/receive/save.
 - **UI → sync handoff.** Reuse the `dirty: AtomicBool` + `status:
   Mutex<String>` handle pattern. Dioxus signals subscribe to it: on dirty,
   re-read `notes()`/`note_metas()`/`todos()` and rebuild views.
 - **Config.** Sync URL + bearer token. v1: a minimal settings screen,
   token stored in the **iOS Keychain** (not plaintext prefs). Host/URL in
   app storage. No discovery — user pastes the tailnet URL once.
+
+## "If I add a note then close the app, does it sync?" — durability vs. sync
+
+These are two separate guarantees. Only the first must be absolute.
+
+1. **Durability (the note is not lost).** Solved locally and independently
+   of the network. `create_note` / `set_note_body` mutate the doc; the UI
+   handler then calls `Store::save()` synchronously before returning. That
+   write is atomic. So the moment the "save/done" action completes, the note
+   is durably on disk in the app sandbox — even if the user immediately force
+   -quits, iOS kills the suspended app, or there has never been a network
+   connection. Nothing is buffered only in memory.
+2. **Sync propagation (the note reaches the server).** Eventually consistent,
+   and *that is fine*. If the app closes before the sync thread flushes the
+   change, the change is still durably in the local Automerge doc. On the
+   next launch, `open_at` reloads it and the sync thread's first
+   `generate_sync_message` against a fresh `SyncState` produces exactly the
+   outstanding change; it converges on the server. No data is lost — sync is
+   only *delayed* to the next launch-and-connect.
+
+The only real failure mode is a bug that lets the UI return *before*
+`Store::save()` completes (e.g. a "fire and forget" save, a debounce, or
+saving on a background tick). The rule that prevents it: **capture actions
+save synchronously and the UI must not signal success until `save()`
+returns `Ok`.** This is a hard requirement, called out again in Milestones
+and tested explicitly (kill the app immediately after add → relaunch →
+note present → later syncs).
+
+Note iOS gives no reliable "about to be killed" callback for a suspended
+app, so there is deliberately **no** "flush to server on background" step —
+relying on one would be the wrong design. Local save-on-write is the whole
+durability story; the server is caught up opportunistically.
+
+## Background sync
+
+Goal: shorten the window between capturing a note and it reaching the
+server, without requiring the user to reopen the app. This is a **latency
+optimisation, not a safety mechanism** — durability above is what guarantees
+nothing is lost; this only affects *how soon* it propagates.
+
+iOS dictates three tiers, and they must not be conflated:
+
+1. **Backgrounded just after a capture (in scope, v1).** When the app moves
+   to the background, take a UIKit `beginBackgroundTask` window (iOS grants
+   on the order of ~30s — not contractually guaranteed, but far more than
+   enough to flush a small Automerge sync over the WebSocket). Keep the
+   existing sync thread running until it reports caught-up or the window is
+   about to expire, then end the task. No new sync logic — this is a
+   lifecycle hook around the thread that already exists. Covers the everyday
+   case ("jotted an idea, switched to Messages") and gets it to the server
+   within seconds.
+2. **Left suspended for hours/days, never reopened (best-effort, post-v1,
+   optional).** A `BGAppRefreshTask` registered with `BGTaskScheduler` that
+   opens the connection, drains, and closes. iOS chooses if/when to run it
+   on its own schedule; it may be delayed for hours or never run for a
+   rarely-used app, and the user can disable Background App Refresh. Documented
+   as best-effort only; **must never be presented or relied on as a delivery
+   guarantee.** Deferred until after v1.
+3. **Force-quit from the app switcher (explicit non-goal).** iOS runs no
+   code from a user-terminated app until it is manually reopened. No
+   mechanism changes this; not `beginBackgroundTask`, not BGTaskScheduler.
+   After a force-quit, the captured note syncs on the next manual launch
+   (durability still holds — it is on disk). This limitation is stated, not
+   worked around.
+
+Silent/remote push is explicitly rejected: the device holds the new data,
+so push solves the wrong direction, and APNs infrastructure is grossly
+disproportionate for a personal Tailscale tool.
+
+Implementation note: `beginBackgroundTask`/`BGTaskScheduler` are UIKit APIs
+Dioxus does not expose, reached via `objc2` FFI plus the Background Modes
+capability (and `Info.plist` task identifiers for tier 2). The tier-1 shim
+is small; tier 2 is fiddlier, which is part of why it is deferred. Tailscale
+must still be up for a background-launched sync to succeed, and the app
+cannot prompt for it from the background — a silent no-op in that case is
+acceptable (durability covers it).
 
 ## Screens (v1)
 
@@ -125,17 +213,28 @@ boring.
 
 ## Milestones
 
-1. **Workspace split** — lib extracted, TUI/server/import build unchanged,
-   CI/tests green. No behaviour change.
+1. **Workspace split** — lib stays as-is, TUI/server/import build unchanged,
+   CI/tests green. No behaviour change. (Dependency hygiene only.)
 2. **`ccal-mobile` skeleton** — Dioxus app builds and runs in the iOS
    simulator, opens a `Store` at the sandbox path, renders a hardcoded
    notes list. No sync.
-3. **Sync port** — async sync task against `ccal-server` over the tailnet;
-   bidirectional convergence verified (add on TUI → appears on phone and
-   vice versa); offline capture survives relaunch and syncs on reconnect.
-4. **Screens + config** — all six screens, Keychain token storage,
+3. **Durability** — add-note path calls `Store::save()` synchronously;
+   explicit test: add a note, immediately kill the app, relaunch, note is
+   present. This is verified *before* sync exists, to prove capture safety
+   does not depend on the network.
+4. **Sync wired up** — `sync_client.rs` thread against `ccal-server` over the
+   tailnet; bidirectional convergence verified (add on TUI → phone and vice
+   versa); a note captured offline (or with the app killed pre-flush) syncs
+   on the next launch+connect.
+5. **Screens + config** — all six screens, Keychain token storage,
    status banner.
-5. **Device + polish** — real-device install on the tailnet, signing,
+6. **Background flush (tier 1)** — `objc2` shim taking a
+   `beginBackgroundTask` window when the app backgrounds; existing sync
+   thread runs until caught-up or the window is about to expire, then the
+   task is ended. Test: add note, background the app (not force-quit),
+   confirm it reaches the server without reopening. (Tier 2 BGAppRefreshTask
+   remains out of v1.)
+7. **Device + polish** — real-device install on the tailnet, signing,
    status-message coverage for the "Tailscale down" case.
 
 ## Risks / open questions
@@ -145,8 +244,6 @@ boring.
 - **Tailscale UX.** If the tailnet is down the app must degrade to a clear
   "offline, capture still works" state, not hang or error. The existing
   backoff handles reconnection; the UI must surface it honestly.
-- **State-machine extraction vs parallel impl.** Resolve in Milestone 3;
-  bias to not regressing the working TUI sync.
 - **Keychain access from a Dioxus/Rust app on iOS.** Validate the crate
   path for Keychain early (Milestone 4); fall back to encrypted app
   storage if it's painful, but never plaintext.
