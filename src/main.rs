@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -46,14 +46,28 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new()?;
+    // Mirrors `app.mouse_on`; the run-loop owns flipping terminal capture
+    // when the user toggles it with `M` (capture off restores native
+    // drag-to-select/copy).
+    let mut mouse_applied = true;
     while !app.should_quit {
         app.tick(); // fold in anything the background sync thread merged
         terminal.draw(|f| ui::draw(f, &app))?;
+        if app.mouse_on != mouse_applied {
+            if app.mouse_on {
+                execute!(io::stdout(), EnableMouseCapture)?;
+            } else {
+                execute!(io::stdout(), DisableMouseCapture)?;
+            }
+            mouse_applied = app.mouse_on;
+        }
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => {
                     app.on_key(key)?;
                 }
+                Event::Mouse(me) => app.on_mouse(me)?,
+                _ => {}
             }
         }
     }
@@ -63,12 +77,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse on by default (matches `App::mouse_on`); `M` toggles it off
+    // at runtime when the user wants native text selection/copy back.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    // Disabling capture when it's already off is a harmless no-op, so this
+    // is safe on the panic path regardless of the runtime toggle state.
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     Ok(())
 }

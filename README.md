@@ -12,6 +12,11 @@ at a glance.
 - **Notes & todos in a terminal.** Markdown notes in a folder tree and an
   ordered, reorderable todo list, in a snappy [ratatui](https://ratatui.rs)
   UI. One static binary, nothing to install alongside it.
+- **Tagged todos & filtering.** Give todos free-text tags, multi-select
+  several at once and tag them in a batch, then filter the list to a single
+  tag with tab-completion. An active filter is shown prominently and is
+  auto-applied to new todos so they don't vanish from the view; `Esc`
+  clears it. Tags sync and time-travel like everything else.
 - **Folders are derived, not managed.** A note's folder is just its path —
   create, move and rename folders implicitly by filing notes; folder rename
   rewrites a whole subtree at once. No empty-folder bookkeeping.
@@ -110,6 +115,38 @@ whole app and sync between devices:
 Bookmarks live in the synced document, so they persist across restarts
 and appear on every device — like Vim's uppercase global marks, but
 shared.
+
+## Todos & tags
+
+The Todos tab (`[2]`) is an ordered, reorderable list — `a` add, `e` /
+`Enter` edit, `d` delete, `J` / `K` move a todo up/down. On top of that,
+todos can be **tagged** and the list **filtered** to a tag:
+
+**Tag todos.**
+
+- Press `Space` on a todo to multi-select it (a `◉` marks selected rows);
+  press `Space` again to deselect. Select as many as you like.
+- Press `t` to tag them. If nothing is multi-selected, `t` tags just the
+  todo under the cursor.
+- Type a tag name and press `Enter`. While typing, `Tab` autocompletes
+  against tags you already use — press it repeatedly to cycle the
+  candidates that match what you've typed so far.
+- A todo can carry any number of tags; tags show as magenta `#chips` on
+  the row. Tagging is additive and idempotent — re-tagging does nothing.
+
+**Filter to a tag.**
+
+- Press `f`, type a tag (with the same `Tab` autocompletion), `Enter`.
+  The list collapses to just the todos carrying that tag.
+- The active filter is shown prominently in the list header
+  (`▶ #tag ◀`). While a filter is on, **any new todo you add with `a`
+  is automatically given that tag**, so it stays visible instead of
+  silently dropping out of the filtered view.
+- Clear the filter by pressing `Esc` (or `f` then an empty `Enter`).
+
+Tags are part of the synced document, so they converge across devices and
+are captured by checkpoints / history exactly like note content — restoring
+to an earlier point restores the tags as they were then.
 
 ## Sync
 Automerge is both the storage format and the sync protocol — it's designed for offline-first distributed synchronisation. `ccal-server` is a small always-on **peer** you run on your own machine: clients all point at it, it merges everything server-side, rebroadcasts so other connected clients converge live, and acts as a free plaintext backup of the whole corpus. No database, no schema, no migrations. It's intended to run behind Tailscale, so the server itself doesn't do transport encryption — you let Tailscale do that — though a bearer token is still checked at the handshake regardless.

@@ -2,12 +2,17 @@
 //! The notes "folders" are a virtual tree derived from each note's
 //! `folder` array — there is no folder entity and no filesystem.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
 use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 
 use ccal::calendar::Occurrence;
 use ccal::models::{now_ms, Calendar, HistoryRow, Note, NoteMeta, Todo};
@@ -34,6 +39,10 @@ pub enum Prompt {
     MoveNote(String),
     /// Rename the folder at this full path; buffer edits its last component.
     RenameFolder(Vec<String>),
+    /// Tag the selected (or marked) todos; buffer is the tag name.
+    TagTodos,
+    /// Filter the todo list to one tag; buffer is the tag (empty = clear).
+    FilterTag,
     /// Create a named checkpoint; buffer is the reason text.
     NewCheckpoint,
     /// Subscribe to a calendar; buffer is the pasted ICS URL.
@@ -79,6 +88,25 @@ pub enum Preview {
     Note { title: String, body: String, private: bool },
 }
 
+/// Where the clickable things were drawn last frame. ratatui has no
+/// hit-testing, so `ui` records these (via `App`'s interior-mutable
+/// `hits`) and `on_mouse` maps a screen `(col,row)` back to an action.
+/// Recomputed every draw, so it always matches what's on screen.
+#[derive(Default, Clone)]
+pub struct Hits {
+    /// `(x_start, x_end_inclusive, tab)` per tab label.
+    pub tabs: Vec<(u16, u16, Tab)>,
+    /// Screen row the tab labels sit on.
+    pub tab_row: u16,
+    /// Inner (border-stripped) area of the active tab's primary
+    /// selectable list — `None` when the current view has no such list.
+    pub list: Option<Rect>,
+    /// The `ListState` scroll offset used to render it (top visible row).
+    pub list_offset: usize,
+    /// How many selectable rows the list currently has.
+    pub list_len: usize,
+}
+
 pub struct App {
     /// Shared with the background sync thread (if any). The lock is held
     /// only for individual store calls — never across a redraw or IO.
@@ -96,14 +124,37 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
 
+    /// Mouse capture on? On by default; `M` toggles it off so the
+    /// terminal's native drag-to-select/copy works, then back on. The
+    /// run-loop owns applying this to the terminal.
+    pub mouse_on: bool,
+    /// Clickable regions from the last draw (see [`Hits`]). Interior-
+    /// mutable so `ui::draw(&App)` can record into it without a `&mut`.
+    hits: RefCell<Hits>,
+
     /// The five most-recently-edited notes shown on the Dashboard's left
     /// pane. Kept in sync by `refresh` (so a remote/local edit reorders it)
     /// — body-free; opening one routes through `open_note_by_id`.
     pub dash_notes: Vec<NoteMeta>,
     pub dash_sel: usize,
 
+    /// The todos currently *shown* — `todos_all` filtered by `tag_filter`
+    /// (== `todos_all` when no filter). `todo_sel` indexes this.
     pub todos: Vec<Todo>,
+    /// Every todo, unfiltered — the source for `todos`, the tag universe
+    /// (autocomplete), and mark pruning.
+    pub todos_all: Vec<Todo>,
     pub todo_sel: usize,
+    /// Active tag filter, shown prominently and auto-applied to new todos.
+    pub tag_filter: Option<String>,
+    /// Multi-selected todo ids (toggled with Space) — the batch that `t`
+    /// tags. Pruned to live ids on every refresh.
+    pub todo_marks: HashSet<String>,
+    /// Tag-autocomplete state for the filter/tag prompts: the prefix the
+    /// user had typed when they first pressed Tab, and how many times they
+    /// have cycled. Cleared whenever the buffer is edited.
+    complete_prefix: Option<String>,
+    complete_idx: usize,
 
     /// Current notes folder path ([] = root).
     pub cur: Vec<String>,
@@ -169,10 +220,17 @@ impl App {
             pending: None,
             should_quit: false,
             status: "Dashboard — ↑↓ recent notes · Enter open · Tab/1-5 switch · q quit".into(),
+            mouse_on: true,
+            hits: RefCell::new(Hits::default()),
             dash_notes: Vec::new(),
             dash_sel: 0,
             todos: Vec::new(),
+            todos_all: Vec::new(),
             todo_sel: 0,
+            tag_filter: None,
+            todo_marks: HashSet::new(),
+            complete_prefix: None,
+            complete_idx: 0,
             cur: Vec::new(),
             entries: Vec::new(),
             entry_sel: 0,
@@ -284,9 +342,27 @@ impl App {
         })
     }
 
+    /// Recompute `todos` (the visible list) from `todos_all` + `tag_filter`,
+    /// and drop marks whose todo no longer exists.
+    fn apply_todo_filter(&mut self) {
+        let live: HashSet<&str> =
+            self.todos_all.iter().map(|t| t.id.as_str()).collect();
+        self.todo_marks.retain(|id| live.contains(id.as_str()));
+        self.todos = match &self.tag_filter {
+            Some(tag) => self
+                .todos_all
+                .iter()
+                .filter(|t| t.tags.iter().any(|x| x == tag))
+                .cloned()
+                .collect(),
+            None => self.todos_all.clone(),
+        };
+    }
+
     fn refresh(&mut self) {
         let todos = self.st().todos();
-        self.todos = todos;
+        self.todos_all = todos;
+        self.apply_todo_filter();
         // Keep the search corpus live: a remote sync edit during a search
         // should show up in the results too.
         if matches!(self.mode, Mode::Search { .. }) {
@@ -483,6 +559,112 @@ impl App {
         Ok(())
     }
 
+    // ---- Mouse ---------------------------------------------------------
+    //
+    // `ui` calls these every draw to record where it put the clickable
+    // things; `on_mouse` reads them back. Interior mutability keeps
+    // `ui::draw(&App)` a pure reader of app *state* while still letting it
+    // stash transient layout geometry.
+
+    /// Record the tab bar: the screen row its labels sit on and each
+    /// label's inclusive x-range.
+    pub fn record_tabs(&self, row: u16, tabs: Vec<(u16, u16, Tab)>) {
+        let mut h = self.hits.borrow_mut();
+        h.tab_row = row;
+        h.tabs = tabs;
+    }
+
+    /// Record the active tab's primary list: its border-stripped inner
+    /// area, the scroll offset it rendered with, and its selectable-row
+    /// count. Call once per frame from whichever `draw_*` owns the list;
+    /// `clear_list_hit` first if the view has none.
+    pub fn record_list(&self, inner: Rect, offset: usize, len: usize) {
+        let mut h = self.hits.borrow_mut();
+        h.list = Some(inner);
+        h.list_offset = offset;
+        h.list_len = len;
+    }
+
+    /// No selectable list this frame (editor, calendar agenda, …).
+    pub fn clear_list_hit(&self) {
+        self.hits.borrow_mut().list = None;
+    }
+
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> Result<()> {
+        // Lists/tabs are only meaningful in Normal mode — ignore clicks
+        // while typing or in the editor (mirrors how the 1-5 tab jumps are
+        // Normal-only). Keyboard still works regardless.
+        if !matches!(self.mode, Mode::Normal) {
+            return Ok(());
+        }
+        let (col, row) = (ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::ScrollDown => self.move_sel(1),
+            MouseEventKind::ScrollUp => self.move_sel(-1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let h = self.hits.borrow().clone();
+                if row == h.tab_row {
+                    if let Some((.., tab)) =
+                        h.tabs.iter().find(|(x0, x1, _)| col >= *x0 && col <= *x1)
+                    {
+                        self.goto_tab(*tab);
+                    }
+                } else if let Some(a) = h.list {
+                    let inside = col >= a.x
+                        && col < a.x + a.width
+                        && row >= a.y
+                        && row < a.y + a.height;
+                    if inside {
+                        let idx = h.list_offset + (row - a.y) as usize;
+                        if idx < h.list_len {
+                            self.click_row(idx)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.clamp();
+        self.update_preview();
+        Ok(())
+    }
+
+    /// A left-click landed on selectable row `idx` of the active tab's
+    /// list. Single-click *opens* (the chosen UX): it selects the row and
+    /// then does exactly what `Enter` would on that tab.
+    fn click_row(&mut self, idx: usize) -> Result<()> {
+        match self.tab {
+            Tab::Dashboard => {
+                self.dash_sel = idx;
+                if let Some(m) = self.dash_notes.get(idx).cloned() {
+                    if !self.open_note_by_id(&m.id) {
+                        self.status = "That note no longer exists".into();
+                    }
+                }
+            }
+            Tab::Todos => {
+                self.todo_sel = idx;
+                self.edit_selected_todo();
+            }
+            Tab::Notes => {
+                self.entry_sel = idx;
+                self.notes_open_selected();
+            }
+            Tab::History => {
+                self.hist_sel = idx;
+                self.hist_preview();
+            }
+            Tab::Calendar => {
+                // Only the manage sub-view is a selectable list; the
+                // agenda is read-only so there's nothing to open.
+                if self.cal_manage {
+                    self.cal_sel = idx;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---- Normal --------------------------------------------------------
 
     fn normal_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -495,6 +677,14 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('M') => {
+                self.mouse_on = !self.mouse_on;
+                self.status = if self.mouse_on {
+                    "Mouse ON — click tabs/rows, wheel scrolls · M to disable for copy".into()
+                } else {
+                    "Mouse OFF — drag to select/copy text · M to re-enable".into()
+                };
+            }
             KeyCode::Char('g') => {
                 self.pending = Some(Pending::Goto);
                 self.status = "g — m: set bookmark · a-z/0-9: go to bookmark · Esc: cancel".into();
@@ -667,12 +857,7 @@ impl App {
                 self.status = "New todo — Enter: save · Esc: cancel".into();
             }
             KeyCode::Char('e') | KeyCode::Enter if !self.todos.is_empty() => {
-                let t = &self.todos[self.todo_sel];
-                self.mode = Mode::Input {
-                    prompt: Prompt::EditTodo(t.id.clone()),
-                    buffer: t.text.clone(),
-                };
-                self.status = "Edit todo — Enter: save · Esc: cancel".into();
+                self.edit_selected_todo();
             }
             KeyCode::Char('d') if !self.todos.is_empty() => {
                 let id = self.todos[self.todo_sel].id.clone();
@@ -701,6 +886,34 @@ impl App {
                     self.todo_sel = i - 1;
                 }
             }
+            KeyCode::Char(' ') if !self.todos.is_empty() => {
+                let id = self.todos[self.todo_sel].id.clone();
+                if !self.todo_marks.remove(&id) {
+                    self.todo_marks.insert(id);
+                }
+                self.status = format!("{} selected — t: tag them", self.todo_marks.len());
+            }
+            KeyCode::Char('t') if !self.todos.is_empty() || !self.todo_marks.is_empty() => {
+                self.complete_prefix = None;
+                let n = self.todo_marks.len().max(1);
+                self.mode = Mode::Input { prompt: Prompt::TagTodos, buffer: String::new() };
+                self.status = format!(
+                    "Tag {n} todo(s) — type a tag · Tab autocomplete · Enter · Esc"
+                );
+            }
+            KeyCode::Char('f') => {
+                self.complete_prefix = None;
+                let buf = self.tag_filter.clone().unwrap_or_default();
+                self.mode = Mode::Input { prompt: Prompt::FilterTag, buffer: buf };
+                self.status =
+                    "Filter by tag — Tab autocomplete · Enter (empty = clear) · Esc".into();
+            }
+            KeyCode::Esc if self.tag_filter.is_some() => {
+                self.tag_filter = None;
+                self.todo_sel = 0;
+                self.apply_todo_filter();
+                self.status = "Tag filter cleared".into();
+            }
             _ => {}
         }
         Ok(())
@@ -717,6 +930,40 @@ impl App {
         }
     }
 
+    /// Activate the current Notes selection (shared by `Enter`/`→` and a
+    /// click): `..` goes up, a folder descends, a note opens in the
+    /// editor.
+    fn notes_open_selected(&mut self) {
+        match self.selected().cloned() {
+            None => {
+                self.cur.pop();
+                self.entry_sel = 0;
+                self.entries = self.build_entries();
+            }
+            Some(Entry::Dir(name)) => {
+                self.cur.push(name);
+                self.entry_sel = 0;
+                self.entries = self.build_entries();
+            }
+            Some(Entry::Note { id, title, .. }) => {
+                let body = self.st().note(&id).map(|n| n.body).unwrap_or_default();
+                self.editor = make_editor(&body);
+                self.mode = Mode::NoteEdit { id, title };
+                self.status = "Editing (NORMAL) — i insert · q save & close".into();
+            }
+        }
+    }
+
+    /// Open the selected todo in the edit prompt (shared by `e`/`Enter`
+    /// and a click).
+    fn edit_selected_todo(&mut self) {
+        if let Some(t) = self.todos.get(self.todo_sel) {
+            let (id, text) = (t.id.clone(), t.text.clone());
+            self.mode = Mode::Input { prompt: Prompt::EditTodo(id), buffer: text };
+            self.status = "Edit todo — Enter: save · Esc: cancel".into();
+        }
+    }
+
     fn notes_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('r') => self.reload(),
@@ -724,24 +971,7 @@ impl App {
                 self.mode = Mode::Input { prompt: Prompt::NewNote, buffer: String::new() };
                 self.status = "Note name — Enter: create · Esc: cancel".into();
             }
-            KeyCode::Enter | KeyCode::Right => match self.selected().cloned() {
-                None => {
-                    self.cur.pop();
-                    self.entry_sel = 0;
-                    self.entries = self.build_entries();
-                }
-                Some(Entry::Dir(name)) => {
-                    self.cur.push(name);
-                    self.entry_sel = 0;
-                    self.entries = self.build_entries();
-                }
-                Some(Entry::Note { id, title, .. }) => {
-                    let body = self.st().note(&id).map(|n| n.body).unwrap_or_default();
-                    self.editor = make_editor(&body);
-                    self.mode = Mode::NoteEdit { id, title };
-                    self.status = "Editing (NORMAL) — i insert · q save & close".into();
-                }
-            },
+            KeyCode::Enter | KeyCode::Right => self.notes_open_selected(),
             KeyCode::Left | KeyCode::Char('h') if !self.at_root() => {
                 self.cur.pop();
                 self.entry_sel = 0;
@@ -881,6 +1111,25 @@ impl App {
                 .into();
     }
 
+    /// Preview the blast radius of restoring to the selected history row
+    /// (shared by `p`/`Enter` and a click).
+    fn hist_preview(&mut self) {
+        if let Some(row) = self.history.get(self.hist_sel).cloned() {
+            // Bind first so the store guard is dropped before we touch
+            // `self.status` (st() borrows self).
+            let res = self.st().preview_restore_to(&row.hash);
+            self.status = match res {
+                Ok(r) => format!(
+                    "Preview: notes +{}/~{}/-{} · todos +{}/~{}/-{} — press r to \
+                     restore the WHOLE corpus to this point",
+                    r.notes_added, r.notes_updated, r.notes_deleted,
+                    r.todos_added, r.todos_updated, r.todos_deleted,
+                ),
+                Err(e) => format!("Preview failed: {e}"),
+            };
+        }
+    }
+
     fn hist_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('c') => {
@@ -890,22 +1139,7 @@ impl App {
                 };
                 self.status = "Snapshot reason — Enter: create · Esc: cancel".into();
             }
-            KeyCode::Char('p') | KeyCode::Enter => {
-                if let Some(row) = self.history.get(self.hist_sel).cloned() {
-                    // Bind first so the store guard is dropped before we
-                    // touch `self.status` (st() borrows self).
-                    let res = self.st().preview_restore_to(&row.hash);
-                    self.status = match res {
-                        Ok(r) => format!(
-                            "Preview: notes +{}/~{}/-{} · todos +{}/~{}/-{} — press r to \
-                             restore the WHOLE corpus to this point",
-                            r.notes_added, r.notes_updated, r.notes_deleted,
-                            r.todos_added, r.todos_updated, r.todos_deleted,
-                        ),
-                        Err(e) => format!("Preview failed: {e}"),
-                    };
-                }
-            }
+            KeyCode::Char('p') | KeyCode::Enter => self.hist_preview(),
             KeyCode::Char('r') => {
                 if let Some(row) = self.history.get(self.hist_sel).cloned() {
                     let res = self.st().restore_to(&row.hash);
@@ -988,16 +1222,50 @@ impl App {
                 self.mode = Mode::Normal;
                 self.status = "Cancelled".into();
             }
-            KeyCode::Char(c) => buffer.push(c),
+            KeyCode::Tab if matches!(prompt, Prompt::TagTodos | Prompt::FilterTag) => {
+                // Cycle through the existing tags that start with whatever
+                // the user had typed before the first Tab. `complete_prefix`
+                // pins that prefix so successive Tabs keep cycling the same
+                // candidate set rather than narrowing onto the last match.
+                if self.complete_prefix.is_none() {
+                    self.complete_prefix = Some(buffer.clone());
+                    self.complete_idx = 0;
+                }
+                let pl = self.complete_prefix.as_deref().unwrap_or("").to_lowercase();
+                let mut cands: Vec<String> = self
+                    .todos_all
+                    .iter()
+                    .flat_map(|t| t.tags.iter().cloned())
+                    .filter(|t| t.to_lowercase().starts_with(&pl))
+                    .collect();
+                cands.sort();
+                cands.dedup();
+                if !cands.is_empty() {
+                    let i = self.complete_idx % cands.len();
+                    self.complete_idx = self.complete_idx.wrapping_add(1);
+                    *buffer = cands.swap_remove(i);
+                }
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                self.complete_prefix = None;
+            }
             KeyCode::Backspace => {
                 buffer.pop();
+                self.complete_prefix = None;
             }
             KeyCode::Enter => {
                 let text = buffer.trim().to_string();
                 match prompt {
                     Prompt::AddTodo => {
                         if !text.is_empty() {
-                            self.st().add_todo(&text)?;
+                            let id = self.st().add_todo(&text)?;
+                            // Under an active filter, a new todo would
+                            // otherwise vanish from view — auto-tag it so it
+                            // stays in the filtered list.
+                            if let Some(tag) = self.tag_filter.clone() {
+                                self.st().tag_todos(&[id], &tag)?;
+                            }
                             self.persist();
                             self.refresh();
                             self.todo_sel = self.todos.len().saturating_sub(1);
@@ -1082,6 +1350,45 @@ impl App {
                             self.status =
                                 format!("Editing (INSERT){at} — Esc then q to save & close");
                         }
+                    }
+                    Prompt::TagTodos => {
+                        let msg = if text.is_empty() {
+                            "Empty tag — cancelled".to_string()
+                        } else {
+                            let ids: Vec<String> = if self.todo_marks.is_empty() {
+                                self.todos
+                                    .get(self.todo_sel)
+                                    .map(|t| t.id.clone())
+                                    .into_iter()
+                                    .collect()
+                            } else {
+                                self.todo_marks.iter().cloned().collect()
+                            };
+                            let res = self.st().tag_todos(&ids, &text);
+                            match res {
+                                Ok(n) => {
+                                    self.persist();
+                                    self.todo_marks.clear();
+                                    format!("Tagged {n} todo(s) #{text}")
+                                }
+                                Err(e) => format!("Tag failed: {e}"),
+                            }
+                        };
+                        self.refresh();
+                        self.mode = Mode::Normal;
+                        self.status = msg;
+                    }
+                    Prompt::FilterTag => {
+                        if text.is_empty() {
+                            self.tag_filter = None;
+                            self.status = "Tag filter cleared".into();
+                        } else {
+                            self.tag_filter = Some(text.clone());
+                            self.status = format!("Filtering todos by #{text}");
+                        }
+                        self.todo_sel = 0;
+                        self.apply_todo_filter();
+                        self.mode = Mode::Normal;
                     }
                     Prompt::NewCheckpoint => {
                         let msg = if text.is_empty() {

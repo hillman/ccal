@@ -313,7 +313,7 @@ fn search_hit_json(m: &NoteMeta, snippet: Option<&str>) -> Value {
 }
 
 fn todo_json(t: &Todo) -> Value {
-    json!({ "id": t.id, "text": t.text, "order": t.order, "created": t.created })
+    json!({ "id": t.id, "text": t.text, "order": t.order, "created": t.created, "tags": t.tags })
 }
 
 fn checkpoint_json(c: &Checkpoint) -> Value {

@@ -3,7 +3,8 @@
 A terminal (ratatui/crossterm) **todo list + markdown notes** app in Rust.
 Two distinct things:
 
-- **Todos** — an ordered set of strings, reorderable.
+- **Todos** — an ordered set of strings, reorderable, each carrying a set
+  of free-text **tags**; the list view can be filtered to one tag.
 - **Notes** — named markdown documents, browsed through a **folder tree**.
   Folders are not an entity: they are *derived* from each note's `folder`
   path array.
@@ -48,7 +49,10 @@ ROOT map:
 - `schema`: Int
 - `notes`: Map  id → `{ title:Str, folder:List<Str>, body:Text,
   created:Int(ms), modified:Int(ms), private:Bool? (absent = false) }`
-- `todos`: Map  id → `{ text:Str, order:F64, created:Int(ms) }`
+- `todos`: Map  id → `{ text:Str, order:F64, created:Int(ms),
+  tags:List<Str>? (absent = none) }` — `tags` is a per-todo field
+  (like a note's `folder`/`private`), so it rides sync with no genesis
+  or ROOT-key change; reconciled on restore like any field.
 - `checkpoints`: Map  id → `{ reason:Str, created:Int(ms),
   heads:List<Str> }` — **lazily created**, NOT in genesis (see below)
 
@@ -175,7 +179,14 @@ edtui. tui-textarea was removed.
 
 Global: `Tab`/`BackTab` cycle Todos→Notes→History · `q` quit · `j/k`/arrows
 move.
-Todos: `a` add · `e`/`Enter` edit · `d` delete · `J`/`K` reorder.
+Todos: `a` add · `e`/`Enter` edit · `d` delete · `J`/`K` reorder ·
+`Space` multi-select · `t` tag the selected/marked todos · `f` filter the
+list to a tag. `t`/`f` open a prompt with **Tab tag-autocomplete** (cycles
+existing tags by typed prefix). A filter is shown in the list title and
+**auto-applied to new todos** (`a`) so they don't vanish from the view;
+empty `f` Enter clears it. `Store::tag_todos` (bulk, one tx, idempotent) /
+`set_todo_tags` are the only tag writers — no MCP tag tool (TUI-only, like
+note privacy); MCP `list_todos` does surface `tags` read-only.
 Notes: `Enter`/`→` open or descend · `←`/`h` up · `n` new · `R` rename ·
 `m` move note · `p` toggle private (hide body from the LLM) · `/` search ·
 `d` delete note · `r` reload store from disk (pick up an external

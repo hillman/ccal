@@ -123,4 +123,8 @@ pub struct Todo {
     /// merges cleanly across replicas; ties broken by `id`.
     pub order: f64,
     pub created: i64,
+    /// Free-text labels for grouping/filtering. Stored as a `List<Str>`
+    /// on the todo (like a note's `folder`), absent = empty — a per-todo
+    /// field, so no genesis change.
+    pub tags: Vec<String>,
 }

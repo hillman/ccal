@@ -15,7 +15,8 @@
 //! - `schema`: Int
 //! - `notes`:  Map  id -> { title:Str, folder:List<Str>, body:Text,
 //!                           created:Int, modified:Int }
-//! - `todos`:  Map  id -> { text:Str, order:F64, created:Int }
+//! - `todos`:  Map  id -> { text:Str, order:F64, created:Int,
+//!                           tags:List<Str>? (absent = none) }
 //! - `cal/<id>`: Map { url:Str, name:Str, created:Int }
 //!
 //! Each calendar *subscription* is its own `cal/<id>` ROOT key (not a child
@@ -610,6 +611,7 @@ impl Store {
                     text: get_str(&self.doc, &obj, "text"),
                     order: get_f64(&self.doc, &obj, "order"),
                     created: get_i64(&self.doc, &obj, "created"),
+                    tags: str_list(&self.doc, &obj, "tags", At::Now),
                 })
             })
             .collect();
@@ -658,6 +660,58 @@ impl Store {
     pub fn delete_todo(&mut self, id: &str) -> Result<()> {
         let mut tx = self.doc.transaction();
         tx.delete(&self.todos, id)?;
+        commit(tx);
+        Ok(())
+    }
+
+    /// Add `tag` to every given todo (idempotent per todo) in a **single
+    /// transaction** — one change, one sync broadcast, like `move_notes`.
+    /// Unknown ids and todos that already carry the tag are skipped;
+    /// returns how many todos actually gained it.
+    pub fn tag_todos(&mut self, ids: &[String], tag: &str) -> Result<usize> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Ok(0);
+        }
+        // Resolve each todo's new tag list under the read borrow, then
+        // mutate (same shape as `rename_folder`).
+        let updates: Vec<(String, Vec<String>)> = ids
+            .iter()
+            .filter_map(|id| {
+                let obj = child(&self.doc, &self.todos, id)?;
+                let mut tags = str_list(&self.doc, &obj, "tags", At::Now);
+                if tags.iter().any(|t| t == tag) {
+                    return None;
+                }
+                tags.push(tag.to_string());
+                Some((id.clone(), tags))
+            })
+            .collect();
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.doc.transaction();
+        for (id, tags) in &updates {
+            let Some((Value::Object(_), obj)) = tx.get(&self.todos, id.as_str())? else {
+                continue;
+            };
+            let list = tx.put_object(&obj, "tags", ObjType::List)?;
+            for (i, c) in tags.iter().enumerate() {
+                tx.insert(&list, i, c.as_str())?;
+            }
+        }
+        commit(tx);
+        Ok(updates.len())
+    }
+
+    /// Replace a todo's entire tag set (used by restore reconciliation).
+    pub fn set_todo_tags(&mut self, id: &str, tags: &[String]) -> Result<()> {
+        let obj = child(&self.doc, &self.todos, id).ok_or_else(|| anyhow!("no such todo"))?;
+        let mut tx = self.doc.transaction();
+        let list = tx.put_object(&obj, "tags", ObjType::List)?;
+        for (i, c) in tags.iter().enumerate() {
+            tx.insert(&list, i, c.as_str())?;
+        }
         commit(tx);
         Ok(())
     }
@@ -942,7 +996,10 @@ impl Store {
                     todos_set.push(t.clone());
                 }
                 Some(l) => {
-                    if l.text != t.text || l.order != t.order || l.created != t.created
+                    if l.text != t.text
+                        || l.order != t.order
+                        || l.created != t.created
+                        || l.tags != t.tags
                     {
                         rep.todos_updated += 1;
                         todos_set.push(t.clone());
@@ -1044,6 +1101,10 @@ impl Store {
             tx.put(&obj, "text", t.text.as_str())?;
             tx.put(&obj, "order", t.order)?;
             tx.put(&obj, "created", t.created)?;
+            let tl = tx.put_object(&obj, "tags", ObjType::List)?;
+            for (i, c) in t.tags.iter().enumerate() {
+                tx.insert(&tl, i, c.as_str())?;
+            }
         }
 
         commit(tx);
@@ -1260,8 +1321,11 @@ fn get_folder<D: ReadDoc>(d: &D, note_obj: &ObjId) -> Vec<String> {
     folder(d, note_obj, At::Now)
 }
 
-fn folder<D: ReadDoc>(d: &D, note_obj: &ObjId, at: At) -> Vec<String> {
-    let Some(list) = as_obj(aget(d, note_obj, "folder", at)) else {
+/// Read a `List<Str>` field (skipping any non-string element). The single
+/// definition behind a note's `folder` and a todo's `tags`; works for both
+/// live (`At::Now`) and at-heads restore reads.
+fn str_list<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, at: At) -> Vec<String> {
+    let Some(list) = as_obj(aget(d, obj, key, at)) else {
         return Vec::new();
     };
     (0..alen(d, &list, at))
@@ -1273,6 +1337,10 @@ fn folder<D: ReadDoc>(d: &D, note_obj: &ObjId, at: At) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+fn folder<D: ReadDoc>(d: &D, note_obj: &ObjId, at: At) -> Vec<String> {
+    str_list(d, note_obj, "folder", at)
 }
 
 fn ensure_map<T: Transactable>(tx: &mut T, key: &str) -> Result<ObjId> {
@@ -1316,6 +1384,7 @@ fn all_todos<D: ReadDoc>(d: &D, todos: &ObjId, at: At) -> Vec<Todo> {
                 text: as_str(aget(d, &o, "text", at)),
                 order: as_f64(aget(d, &o, "order", at)),
                 created: as_i64(aget(d, &o, "created", at)),
+                tags: str_list(d, &o, "tags", at),
             })
         })
         .collect()

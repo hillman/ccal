@@ -26,6 +26,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
+    // Reset the per-frame clickable-list region; whichever view owns a
+    // selectable list re-records it below. Cleared views (editor, calendar
+    // agenda) thus correctly have no list hit-target.
+    app.clear_list_hit();
+
     draw_tabs(f, app, chunks[0]);
     match &app.mode {
         Mode::NoteEdit { title, .. } => {
@@ -59,20 +64,47 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_status(f, app, chunks[2]);
 }
 
+/// Border-stripped inner area of a `Borders::ALL` block (where its content
+/// actually renders) — used to map a click back to a row/label.
+fn inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let sel = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
     let unsel = Style::default().fg(Color::Cyan);
-    let spans = vec![
-        Span::styled(" [1] Dashboard ", if app.tab == Tab::Dashboard { sel } else { unsel }),
-        Span::raw("  "),
-        Span::styled(" [2] Todos ", if app.tab == Tab::Todos { sel } else { unsel }),
-        Span::raw("  "),
-        Span::styled(" [3] Notes ", if app.tab == Tab::Notes { sel } else { unsel }),
-        Span::raw("  "),
-        Span::styled(" [4] Calendar ", if app.tab == Tab::Calendar { sel } else { unsel }),
-        Span::raw("  "),
-        Span::styled(" [5] History ", if app.tab == Tab::History { sel } else { unsel }),
+    let labels = [
+        (" [1] Dashboard ", Tab::Dashboard),
+        (" [2] Todos ", Tab::Todos),
+        (" [3] Notes ", Tab::Notes),
+        (" [4] Calendar ", Tab::Calendar),
+        (" [5] History ", Tab::History),
     ];
+    // Build the spans and, in lockstep, each label's inclusive x-range so
+    // a click on the tab bar maps back to its tab. Content starts one cell
+    // in from the border; labels are separated by a 2-space raw gap.
+    let mut spans: Vec<Span> = Vec::new();
+    let mut hits: Vec<(u16, u16, Tab)> = Vec::new();
+    let mut x = area.x + 1;
+    for (i, (label, tab)) in labels.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            x += 2;
+        }
+        let w = label.chars().count() as u16;
+        hits.push((x, x + w - 1, *tab));
+        x += w;
+        spans.push(Span::styled(
+            *label,
+            if app.tab == *tab { sel } else { unsel },
+        ));
+    }
+    app.record_tabs(area.y + 1, hits);
     let mut block = Block::default().borders(Borders::ALL).title(" ccal ");
     if let Some(s) = app.sync_indicator() {
         let online = s.starts_with('●');
@@ -141,6 +173,7 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
         nstate.select(Some(app.dash_sel));
     }
     f.render_stateful_widget(notes, halves[0], &mut nstate);
+    app.record_list(inner(halves[0]), nstate.offset(), app.dash_notes.len());
 
     // Right: todos over today's agenda, half height each.
     let right = Layout::default()
@@ -207,16 +240,68 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
+    // Tags are rendered as a right-aligned column rather than trailing the
+    // text, so the list reads cleanly down the left edge. Usable width =
+    // area minus the block borders (2) and the highlight-symbol gutter (2,
+    // reserved on every row).
+    let width = area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem> = app
         .todos
         .iter()
-        .map(|t| ListItem::new(format!("• {}", t.text)))
+        .map(|t| {
+            let marked = app.todo_marks.contains(&t.id);
+            let marker = if marked { "◉ " } else { "• " };
+            let tags = if t.tags.is_empty() {
+                String::new()
+            } else {
+                t.tags.iter().map(|tag| format!("#{tag}")).collect::<Vec<_>>().join(" ")
+            };
+            let tags_w = tags.chars().count();
+            // Reserve the tag column (plus a two-space gutter) on the right;
+            // truncate the text with an ellipsis if the row is too narrow.
+            let reserved = if tags_w == 0 { 0 } else { tags_w + 2 };
+            let text_room = width.saturating_sub(marker.chars().count() + reserved);
+            let mut text = t.text.clone();
+            if text.chars().count() > text_room {
+                text = text
+                    .chars()
+                    .take(text_room.saturating_sub(1))
+                    .collect::<String>()
+                    + "…";
+            }
+            let used = marker.chars().count() + text.chars().count() + reserved;
+            let pad = " ".repeat(width.saturating_sub(used));
+            let spans = vec![
+                Span::styled(
+                    marker,
+                    if marked {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::raw(text),
+                Span::raw(pad),
+                Span::styled(tags, Style::default().fg(Color::Magenta)),
+            ];
+            ListItem::new(Line::from(spans))
+        })
         .collect();
+    let title = match &app.tag_filter {
+        Some(tag) => format!(
+            " Todos  ▶ #{tag} ◀  ({} shown · Esc clears · t tag · f filter · Space sel) ",
+            app.todos.len()
+        ),
+        None => {
+            " Todos  (a add · e edit · d del · J/K move · Space select · t tag · f filter) "
+                .to_string()
+        }
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Todos  (a add · e edit · d del · J/K move) "),
+                .title(title),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
@@ -225,6 +310,7 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.todo_sel));
     }
     f.render_stateful_widget(list, area, &mut state);
+    app.record_list(inner(area), state.offset(), app.todos.len());
 }
 
 /// One row for a folder/note entry. `dim` greys it out — used in the
@@ -305,6 +391,7 @@ fn draw_notes(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.entry_sel));
     }
     f.render_stateful_widget(list, panes[0], &mut state);
+    app.record_list(inner(panes[0]), state.offset(), rows);
 
     // --- Right: context preview of whatever is selected --------------
     draw_preview(f, app, panes[1]);
@@ -418,6 +505,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.hist_sel));
     }
     f.render_stateful_widget(list, area, &mut state);
+    app.record_list(inner(area), state.offset(), app.history.len());
 }
 
 /// The Calendar tab: a read-only agenda (Today, then the next 7 days), or
@@ -543,6 +631,7 @@ fn draw_cal_manage(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.cal_sel));
     }
     f.render_stateful_widget(list, area, &mut state);
+    app.record_list(inner(area), state.offset(), app.cal_subs.len());
 }
 
 /// One-line hint shown above the input field, tailored to what's being
@@ -552,6 +641,14 @@ fn input_hint(prompt: &Prompt) -> &'static str {
     match prompt {
         Prompt::AddTodo => "New todo  ·  Enter save  ·  Esc cancel",
         Prompt::EditTodo(_) => "Edit todo  ·  Enter save  ·  Esc cancel",
+        Prompt::TagTodos => {
+            "Tag the selected/marked todos  ·  Tab autocompletes  ·  \
+             Enter  ·  Esc"
+        }
+        Prompt::FilterTag => {
+            "Filter todos by tag  ·  Tab autocompletes  ·  empty Enter \
+             clears  ·  Esc"
+        }
         Prompt::NewNote => {
             "Note name — type folder/note (or folder\\note) to file it; \
              the folders are created  ·  Enter  ·  Esc"
