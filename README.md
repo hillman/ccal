@@ -46,6 +46,11 @@ at a glance.
   read, create, edit, move, rename and delete notes & todos — 18 tools —
   and because the edits ride the same sync broadcast, they appear **live**
   in every open ccal client.
+- **Web app (browser + PWA).** `ccal-server` serves an installable,
+  offline-capable web app — the same notes & todos, phone-first — **embedded
+  in the binary**. The browser is a real Automerge *peer* over the same sync
+  socket, so edits are local, conflict-free and work offline (the doc is
+  cached in IndexedDB). No separate web host.
 - **Checkpoints & time-travel.** Automerge keeps the whole history, so
   snapshots are essentially free. Create named checkpoints; roll the whole
   corpus back to any checkpoint *or any point in the edit log*. Restore is
@@ -262,6 +267,47 @@ assistant is told to checkpoint before/after each batch, there's always a
 labelled point to come back to if it makes a mess.
 
 
+
+## Web app
+
+`ccal-server` can also serve a **web app** — the same notes & todos as the
+TUI, in the browser, phone-first. It's a true Automerge **peer**: the whole
+document runs client-side over the same `/sync` socket, so editing is local,
+conflict-free and **offline-capable** — the doc is cached in IndexedDB, so a
+cold, offline launch shows your last synced state and queues edits until the
+socket returns. It's an installable PWA ("Add to Home Screen" for an app-like
+window), and on a phone the notes and todos become tabs.
+
+It's **embedded in the release `ccal-server` binary** — run the server and
+open its address in a browser; there's no separate web host. Enter your bearer
+token once (browsers can't send an `Authorization` header on a WebSocket, so
+the token rides the `Sec-WebSocket-Protocol` subprotocol).
+
+The web client is a fully-trusted peer, equal to the TUI — it receives the
+whole document, including private-note bodies, so it's meant for your own
+devices behind Tailscale, the same trust model as the server. The private flag
+shows as a 🔒 marker but, deliberately, can't be toggled from the web —
+privacy stays a TUI action so there's one authority for it. History /
+checkpoints are likewise TUI-only.
+
+**Build it** (the release does this automatically):
+
+```sh
+cd web && npm ci && npm run build      # produces web/dist
+cargo build --release --features web   # ccal-server embeds web/dist
+```
+
+For development, run `ccal-server` normally and use the vite dev server (hot
+reload), which proxies `/sync` to it:
+
+```sh
+cd web && npm run dev                  # http://localhost:5173
+# non-default server: CCAL_SERVER=host:port npm run dev
+```
+
+Setting `CCAL_WEB_DIR=/path/to/web/dist` makes a `--features web` server serve
+assets from disk instead of the embedded copy — handy for iterating without a
+rebuild.
 
 ## Mobile App
 I want a very basic mobile app, as I think up ideas in the night or out and about, and I need a way to capture them.  It will never be fully featured — just a way to get notes/todos into this system and view them.  Decision made: it's a Dioxus app (iOS first), reusing the Rust core and sync, and it's Tailscale-dependent like the server.  The full design is in [docs/plans/mobile-app.md](docs/plans/mobile-app.md).

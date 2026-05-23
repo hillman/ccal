@@ -3,6 +3,14 @@ name = "ccal"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# ccal-server only: serve the built PWA shell as a router fallback. By default
+# the assets are embedded into the binary at build time (rust-embed) for a
+# self-contained release; setting CCAL_WEB_DIR at runtime serves from that
+# directory instead (dev, no rebuild). `tokio/fs` is for the disk path. Off by
+# default so a plain build never needs a `web/dist`. See web-interface.md.
+web = ["tokio/fs", "dep:rust-embed"]
+
 [lib]
 name = "ccal"
 path = "src/lib.rs"
@@ -55,6 +63,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # (CCAL_MCP / `[server] mcp`); absent ⇒ this code never runs.
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "macros"] }
 tokio-util = "0.7"
+# ccal-server `web` feature only — embeds web/dist into the binary. debug-embed
+# makes embedding deterministic in debug builds too (default rust-embed reads
+# from disk in debug); the CCAL_WEB_DIR runtime override is the dev path.
+rust-embed = { version = "8", features = ["debug-embed"], optional = true }
 ureq = "3.3.0"
 icalendar = "0.17.10"
 rrule = "0.14.0"

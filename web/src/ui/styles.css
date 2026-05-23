@@ -1,0 +1,141 @@
+:root {
+  --bg: #1e1e2e;
+  --bg2: #181825;
+  --panel: #262638;
+  --fg: #cdd6f4;
+  --muted: #9399b2;
+  --accent: #89b4fa;
+  --danger: #f38ba8;
+  --border: #313244;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, sans-serif;
+}
+button {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.4; cursor: default; }
+button.danger { color: var(--danger); }
+button.link { background: none; border: none; color: var(--accent); }
+input, textarea {
+  background: var(--bg2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
+
+/* Token gate */
+.gate {
+  max-width: 320px;
+  margin: 15vh auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 16px;
+}
+.gate h1 { margin: 0; }
+.gate p { color: var(--muted); margin: 0; }
+
+/* App shell. dvh (with vh fallback) so the on-screen keyboard shrinks the
+   layout instead of hiding content behind it. */
+.app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+           8px max(12px, env(safe-area-inset-left));
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+.spacer { flex: 1; }
+.status { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--panel); }
+.status-online { color: #a6e3a1; }
+.status-offline { color: var(--danger); }
+.status-connecting { color: #f9e2af; }
+
+.syncing { padding: 40px; text-align: center; color: var(--muted); }
+
+/* Tab bar: only shown on narrow screens (see media query). */
+.tabs { display: none; gap: 4px; padding: 6px 8px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+.tabs button { flex: 1; }
+.tabs button.active { background: var(--accent); color: #11111b; border-color: var(--accent); }
+
+.panes { display: flex; flex: 1; min-height: 0; }
+.sidebar {
+  width: 260px;
+  border-right: 1px solid var(--border);
+  overflow: auto;
+  padding: 8px;
+  background: var(--bg2);
+}
+.sidebar-actions { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.crumb { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+
+.tree { font-size: 13px; }
+.folder-name { display: flex; align-items: center; gap: 2px; padding: 2px 4px; border-radius: 4px; color: var(--muted); }
+.folder-name.active { background: var(--panel); color: var(--fg); }
+.caret { cursor: pointer; width: 14px; text-align: center; user-select: none; flex: none; }
+.folder-label { cursor: pointer; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.folder-count { color: var(--muted); font-size: 11px; }
+.folder-children { margin-left: 12px; border-left: 1px solid var(--border); padding-left: 6px; }
+.note-item { cursor: pointer; padding: 3px 6px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.note-item:hover { background: var(--panel); }
+.note-item.selected { background: var(--accent); color: #11111b; }
+
+.editor-pane { flex: 1; min-width: 0; display: flex; }
+.empty { margin: auto; color: var(--muted); }
+.editor { display: flex; flex-direction: column; flex: 1; padding: 12px; gap: 8px; min-width: 0; }
+.editor-head { display: flex; align-items: center; gap: 8px; }
+.editor .title { flex: 1; font-size: 18px; font-weight: 600; }
+.editor .folder { font-size: 12px; color: var(--muted); }
+.editor .body { flex: 1; resize: none; line-height: 1.6; font-family: ui-monospace, monospace; }
+.editor .meta { color: var(--muted); font-size: 11px; }
+.lock { font-size: 14px; }
+
+.todos-pane { width: 280px; border-left: 1px solid var(--border); overflow: auto; padding: 12px; background: var(--bg2); }
+.todos h2 { margin: 0 0 8px; font-size: 15px; }
+.todos form input { width: 100%; }
+.todo-list { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 4px; }
+.todo { display: flex; gap: 4px; align-items: center; }
+.todo .todo-text { flex: 1; }
+.todo button { padding: 4px 6px; }
+
+/* Narrow screens: Notes / Todos become tabs — only the active pane shows,
+   plus bigger touch targets and keyboard/safe-area friendliness. */
+@media (max-width: 720px) {
+  .tabs { display: flex; }
+  .panes { flex-direction: column; }
+  .sidebar, .todos-pane { width: auto; border: none; }
+  /* Notes tab: hide todos; sidebar caps height, editor fills the rest. */
+  .panes[data-tab="notes"] .todos-pane { display: none; }
+  .panes[data-tab="notes"] .sidebar { max-height: 40vh; border-bottom: 1px solid var(--border); }
+  /* Todos tab: hide note browsing + editor; todos fill the screen. */
+  .panes[data-tab="todos"] .sidebar,
+  .panes[data-tab="todos"] .editor-pane { display: none; }
+  .panes[data-tab="todos"] .todos-pane { flex: 1; }
+
+  /* Touch targets */
+  button { min-height: 40px; padding: 8px 12px; }
+  input, textarea { font-size: 16px; } /* >=16px stops iOS zoom-on-focus */
+  .note-item { padding: 9px 6px; }
+  .folder-name { padding: 7px 4px; }
+  .caret { width: 32px; line-height: 28px; }
+  .todo { gap: 6px; }
+  .todo button { min-width: 40px; }
+
+  /* Safe-area breathing room at the bottom for home-indicator phones. */
+  .todos-pane, .editor { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+}

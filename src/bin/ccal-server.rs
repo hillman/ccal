@@ -10,10 +10,24 @@
 //! Wire protocol (deliberately language-neutral so `automerge-swift` on iOS
 //! speaks it unchanged):
 //!   - `wss://host/sync/{docid}` WebSocket upgrade
-//!   - `Authorization: Bearer <token>` checked at the upgrade; a wrong/absent
-//!     token is rejected before the socket opens — no in-band auth frame
+//!   - the bearer token is checked at the upgrade; a wrong/absent token is
+//!     rejected before the socket opens — no in-band auth frame. Three
+//!     equivalent ways to present it (any one suffices):
+//!       * `Authorization: Bearer <token>` — the TUI / automerge-swift path,
+//!         unchanged.
+//!       * `Sec-WebSocket-Protocol: ccal.bearer.<token>` — for browsers,
+//!         which cannot set `Authorization` on a `WebSocket`. Preferred over
+//!         the query form: it stays out of access logs. Echoed back per spec.
+//!       * `?token=<token>` query param — documented fallback for clients
+//!         that can't set a subprotocol (token must be URL-safe).
 //!   - every binary frame is raw `automerge::sync::Message` bytes, nothing
 //!     else; text/ping frames are ignored (reserved for future control)
+//!
+//! With the `web` cargo feature, a static-asset fallback also serves the
+//! built PWA shell (`CCAL_WEB_DIR`, default `web/dist`) — see
+//! `docs/plans/web-interface.md`. It never shadows `/sync` or `/mcp` (it is
+//! the router *fallback*) and is unauthenticated: it is only the app shell;
+//! all data still flows through the bearer-gated sync socket above.
 //!
 //! Trust model: the operator owns and trusts this box. The document is
 //! stored as plaintext (atomic temp+rename, debounced). That also makes the
@@ -35,7 +49,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{Path, Request, State},
+    extract::{Path, RawQuery, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -168,6 +182,18 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Optional static-asset fallback serving the built PWA shell. Mounted as
+    // the router *fallback* so `/sync/:doc` and `/mcp` always win; absent the
+    // `web` feature this code (and the dependency-free handler) is gone.
+    #[cfg(feature = "web")]
+    let router = {
+        match std::env::var("CCAL_WEB_DIR") {
+            Ok(dir) => eprintln!("ccal-server: serving web app from {dir} (disk, router fallback)"),
+            Err(_) => eprintln!("ccal-server: serving embedded web app (router fallback)"),
+        }
+        router.fallback(web_asset)
+    };
+
     let router = router.with_state(app);
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -227,18 +253,48 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
+/// A bearer token offered via the WebSocket subprotocol header as
+/// `ccal.bearer.<token>` — the browser auth path (browsers can set a
+/// subprotocol but not `Authorization`, and it stays out of access logs
+/// unlike a query string). Returns `(full_protocol, token)` so the caller can
+/// echo the exact protocol back per the WS spec. The header is a
+/// comma-separated list; the first matching entry wins.
+fn subprotocol_token(headers: &HeaderMap) -> Option<(&str, &str)> {
+    headers
+        .get("sec-websocket-protocol")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("ccal.bearer.").map(|t| (p, t)))
+}
+
+/// A bearer token offered as a `?token=<token>` query param — the documented
+/// fallback for clients that can set neither header nor subprotocol. The
+/// value is taken raw (tokens are expected URL-safe).
+fn query_token(query: Option<&str>) -> Option<&str> {
+    query?.split('&').find_map(|kv| kv.strip_prefix("token="))
+}
+
 async fn sync_handler(
     Path(docid): Path<String>,
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     // `Option<_>` so a non-upgrade request can't reject *before* the auth
     // check: token enforcement must not depend on extractor ordering.
     ws: Option<WebSocketUpgrade>,
 ) -> Response {
     // Reject at the handshake so the socket never opens unauthenticated.
     // Constant-ish comparison is unnecessary here (single trusted operator),
-    // but keep the check before any work.
-    if bearer(&headers) != Some(app.token.as_str()) {
+    // but keep the check before any work. The token may arrive via header
+    // (TUI), subprotocol (browser) or query (fallback) — any one suffices.
+    let want = app.token.as_str();
+    let subproto = subprotocol_token(&headers);
+    let authed = bearer(&headers) == Some(want)
+        || subproto.map(|(_, t)| t) == Some(want)
+        || query_token(query.as_deref()) == Some(want);
+    if !authed {
         return (StatusCode::UNAUTHORIZED, "bad or missing bearer token").into_response();
     }
     let Some(ws) = ws else {
@@ -254,6 +310,12 @@ async fn sync_handler(
             eprintln!("ccal-server: open {docid}: {e:#}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "could not open doc").into_response();
         }
+    };
+    // When the client authed via subprotocol, echo that exact protocol back
+    // (per RFC 6455) so the browser's negotiated `WebSocket.protocol` is set.
+    let ws = match subproto {
+        Some((full, t)) if t == want => ws.protocols([full.to_string()]),
+        _ => ws,
     };
     ws.on_upgrade(move |socket| serve_peer(socket, doc))
 }
@@ -318,5 +380,74 @@ async fn flush(socket: &mut WebSocket, doc: &Arc<Doc>, state: &mut SyncState) ->
                 .map_err(|_| ())?,
             None => return Ok(()),
         }
+    }
+}
+
+/// The PWA shell, embedded into the binary at build time so a release is a
+/// single self-contained artifact. `CCAL_WEB_DIR` overrides this at runtime to
+/// serve from disk instead (dev iteration without a rebuild).
+#[cfg(feature = "web")]
+#[derive(rust_embed::RustEmbed)]
+#[folder = "web/dist"]
+struct WebAssets;
+
+/// Static-asset fallback serving the built PWA shell. Unknown paths fall back
+/// to `index.html` so the SPA's client-side routing works. Unauthenticated by
+/// design — only the app shell; all data flows through the bearer-gated sync
+/// socket. Embedded by default; disk-served when `CCAL_WEB_DIR` is set.
+#[cfg(feature = "web")]
+async fn web_asset(uri: axum::http::Uri) -> Response {
+    let req = uri.path().trim_start_matches('/');
+    if let Some(dir) = std::env::var_os("CCAL_WEB_DIR") {
+        return web_asset_disk(std::path::Path::new(&dir), req).await;
+    }
+    // Embedded: the requested file, else the SPA shell.
+    let (name, file) = match WebAssets::get(req) {
+        Some(f) if !req.is_empty() => (req, f),
+        _ => match WebAssets::get("index.html") {
+            Some(f) => ("index.html", f),
+            None => return (StatusCode::NOT_FOUND, "web app not embedded").into_response(),
+        },
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, web_content_type(std::path::Path::new(name)))],
+        file.data.into_owned(),
+    )
+        .into_response()
+}
+
+/// Disk variant of [`web_asset`] used when `CCAL_WEB_DIR` is set.
+#[cfg(feature = "web")]
+async fn web_asset_disk(root: &std::path::Path, req: &str) -> Response {
+    use std::path::{Component, Path as FsPath};
+    // Only normal path components — no traversal out of the web dir.
+    let safe = !req.is_empty()
+        && FsPath::new(req).components().all(|c| matches!(c, Component::Normal(_)));
+    let candidate = if safe { root.join(req) } else { root.to_path_buf() };
+    let path = if candidate.is_file() { candidate } else { root.join("index.html") };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, web_content_type(&path))],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "web app not built (web/dist missing)").into_response(),
+    }
+}
+
+#[cfg(feature = "web")]
+fn web_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
+        Some("wasm") => "application/wasm",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
     }
 }

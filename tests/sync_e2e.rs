@@ -87,6 +87,69 @@ async fn rejects_bad_token() {
     assert!(err.is_err(), "handshake must fail with a bad token");
 }
 
+/// Browsers can't set `Authorization` on a WebSocket, so the token may arrive
+/// via the `Sec-WebSocket-Protocol` subprotocol as `ccal.bearer.<token>`. The
+/// server must accept it AND echo the exact protocol back per RFC 6455.
+#[tokio::test]
+async fn accepts_subprotocol_token_and_echoes_it() {
+    let addr = "127.0.0.1:8793";
+    let (_srv, _data) = start_server(addr).await;
+
+    let mut r = format!("ws://{addr}/sync/ccal").into_client_request().unwrap();
+    let proto = format!("ccal.bearer.{TOKEN}");
+    r.headers_mut()
+        .insert("sec-websocket-protocol", proto.parse().unwrap());
+
+    let (_ws, resp) = tokio_tungstenite::connect_async(r)
+        .await
+        .expect("subprotocol token must be accepted");
+    assert_eq!(
+        resp.headers()
+            .get("sec-websocket-protocol")
+            .and_then(|v| v.to_str().ok()),
+        Some(proto.as_str()),
+        "server must echo the selected subprotocol",
+    );
+}
+
+/// A wrong token in the subprotocol is still rejected.
+#[tokio::test]
+async fn rejects_bad_subprotocol_token() {
+    let addr = "127.0.0.1:8794";
+    let (_srv, _data) = start_server(addr).await;
+
+    let mut r = format!("ws://{addr}/sync/ccal").into_client_request().unwrap();
+    r.headers_mut()
+        .insert("sec-websocket-protocol", "ccal.bearer.wrong".parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(r).await.is_err(),
+        "a bad subprotocol token must be rejected",
+    );
+}
+
+/// Documented fallback: the token may arrive as a `?token=` query param.
+#[tokio::test]
+async fn accepts_query_token() {
+    let addr = "127.0.0.1:8795";
+    let (_srv, _data) = start_server(addr).await;
+
+    let r = format!("ws://{addr}/sync/ccal?token={TOKEN}")
+        .into_client_request()
+        .unwrap();
+    assert!(
+        tokio_tungstenite::connect_async(r).await.is_ok(),
+        "query token must be accepted",
+    );
+
+    let bad = format!("ws://{addr}/sync/ccal?token=wrong")
+        .into_client_request()
+        .unwrap();
+    assert!(
+        tokio_tungstenite::connect_async(bad).await.is_err(),
+        "a bad query token must be rejected",
+    );
+}
+
 #[tokio::test]
 async fn two_replicas_converge_through_server() {
     let addr = "127.0.0.1:8792";

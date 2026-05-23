@@ -53,6 +53,13 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Resolve version & mode
         id: meta
         run: |
@@ -68,8 +75,16 @@ jobs:
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
           echo "Building ${version} for ${{ matrix.label }} (publish release: ${publish})"
 
+      # Build the PWA first so `--features web` can embed web/dist into
+      # ccal-server (a self-contained binary — no separate web host).
+      - name: Build web app
+        run: |
+          cd web
+          npm ci
+          npm run build
+
       - name: Build release binaries
-        run: cargo build --release --locked --bins
+        run: cargo build --release --locked --bins --features web
 
       - name: Package
         id: package
@@ -101,6 +116,9 @@ jobs:
             macOS (Apple Silicon / `aarch64-apple-darwin`) and Linux
             (`x86_64-unknown-linux-gnu`) builds of `ccal`, `ccal-server`,
             `import-bear`. Pick the tarball for your platform.
+
+            `ccal-server` has the web app (notes & todos PWA) **embedded** —
+            run it and open its address in a browser; no separate web host.
 
             **The macOS binaries are unsigned.** macOS will quarantine them
             on first run ("cannot be opened because the developer cannot be
