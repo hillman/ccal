@@ -7,6 +7,7 @@
   --accent: #89b4fa;
   --danger: #f38ba8;
   --border: #313244;
+  --caret-w: 16px; /* folder caret width; children indent past caret + icon */
 }
 
 * { box-sizing: border-box; }
@@ -27,6 +28,7 @@ button {
 button:disabled { opacity: 0.4; cursor: default; }
 button.danger { color: var(--danger); }
 button.link { background: none; border: none; color: var(--accent); }
+button.primary { background: var(--accent); color: #11111b; border-color: var(--accent); }
 input, textarea {
   background: var(--bg2);
   color: var(--fg);
@@ -87,10 +89,12 @@ input, textarea {
 .tree { font-size: 13px; }
 .folder-name { display: flex; align-items: center; gap: 2px; padding: 2px 4px; border-radius: 4px; color: var(--muted); }
 .folder-name.active { background: var(--panel); color: var(--fg); }
-.caret { cursor: pointer; width: 14px; text-align: center; user-select: none; flex: none; }
+.caret { cursor: pointer; width: var(--caret-w); text-align: center; user-select: none; flex: none; }
 .folder-label { cursor: pointer; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .folder-count { color: var(--muted); font-size: 11px; }
-.folder-children { margin-left: 12px; border-left: 1px solid var(--border); padding-left: 6px; }
+/* Indent children just past the folder's caret so they nest under the folder
+   name, without each level stepping in too far. */
+.folder-children { margin-left: calc(var(--caret-w) + 0.5em); border-left: 1px solid var(--border); padding-left: 4px; }
 .note-item { cursor: pointer; padding: 3px 6px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .note-item:hover { background: var(--panel); }
 .note-item.selected { background: var(--accent); color: #11111b; }
@@ -105,23 +109,51 @@ input, textarea {
 .editor .meta { color: var(--muted); font-size: 11px; }
 .lock { font-size: 14px; }
 
+/* Full-screen note editor (mobile): a top bar with the Save (back) action, the
+   body filling the rest. */
+.editor-mobile { padding: 0; gap: 0; }
+.editor-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+           8px max(12px, env(safe-area-inset-left));
+  background: var(--bg2); border-bottom: 1px solid var(--border);
+}
+.editor-bar .spacer { flex: 1; }
+.editor-mobile > .editor-head { margin: 10px 12px 0; }
+.editor-mobile > .folder { margin: 8px 12px 0; }
+.editor-mobile > .body { margin: 8px 12px max(12px, env(safe-area-inset-bottom)); }
+
 .todos-pane { width: 280px; border-left: 1px solid var(--border); overflow: auto; padding: 12px; background: var(--bg2); }
 .todos h2 { margin: 0 0 8px; font-size: 15px; }
-.todos form input { width: 100%; }
+.todo-add { display: flex; gap: 6px; }
+.todo-add input { flex: 1; min-width: 0; }
 .todo-list { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 4px; }
-.todo { display: flex; gap: 4px; align-items: center; }
-.todo .todo-text { flex: 1; }
-.todo button { padding: 4px 6px; }
+
+/* Each row sits on a red "delete" layer revealed by swiping the row right
+   (mobile). The row has an opaque background so the layer only shows on swipe. */
+.todo-swipe { position: relative; border-radius: 6px; background: var(--danger); overflow: hidden; }
+.todo-swipe-hint { position: absolute; left: 12px; top: 0; bottom: 0; display: flex; align-items: center; }
+.todo-row { position: relative; display: flex; gap: 2px; align-items: center; background: var(--bg2); border-radius: 6px; }
+.todo-row.dragging { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4); }
+.todo-content { flex: 1; min-width: 0; display: flex; }
+.todo-label { flex: 1; padding: 7px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: text; }
+.todo-text { flex: 1; width: 100%; }
+.handle { cursor: grab; touch-action: none; color: var(--muted); background: none; border: none; padding: 7px 8px; }
+.todo-row button.edit { background: none; border: none; color: var(--accent); }
+.todo-row button { padding: 7px 8px; }
 
 /* Narrow screens: Notes / Todos become tabs — only the active pane shows,
    plus bigger touch targets and keyboard/safe-area friendliness. */
 @media (max-width: 720px) {
+  :root { --caret-w: 28px; } /* wider touch caret → children indent further */
   .tabs { display: flex; }
   .panes { flex-direction: column; }
   .sidebar, .todos-pane { width: auto; border: none; }
-  /* Notes tab: hide todos; sidebar caps height, editor fills the rest. */
-  .panes[data-tab="notes"] .todos-pane { display: none; }
-  .panes[data-tab="notes"] .sidebar { max-height: 40vh; border-bottom: 1px solid var(--border); }
+  /* Notes tab: just the directory listing, full height. Selecting a note
+     opens the full-screen editor (App), so there's no inline preview pane. */
+  .panes[data-tab="notes"] .todos-pane,
+  .panes[data-tab="notes"] .editor-pane { display: none; }
+  .panes[data-tab="notes"] .sidebar { flex: 1; max-height: none; }
   /* Todos tab: hide note browsing + editor; todos fill the screen. */
   .panes[data-tab="todos"] .sidebar,
   .panes[data-tab="todos"] .editor-pane { display: none; }
@@ -132,9 +164,9 @@ input, textarea {
   input, textarea { font-size: 16px; } /* >=16px stops iOS zoom-on-focus */
   .note-item { padding: 9px 6px; }
   .folder-name { padding: 7px 4px; }
-  .caret { width: 32px; line-height: 28px; }
-  .todo { gap: 6px; }
-  .todo button { min-width: 40px; }
+  .caret { line-height: 28px; }
+  .todo-row button { min-width: 40px; min-height: 40px; }
+  .todo-label { padding: 10px 6px; }
 
   /* Safe-area breathing room at the bottom for home-indicator phones. */
   .todos-pane, .editor { padding-bottom: max(12px, env(safe-area-inset-bottom)); }

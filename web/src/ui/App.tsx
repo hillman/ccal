@@ -5,6 +5,7 @@ import { FolderTree } from "./FolderTree";
 import { NoteEditor } from "./NoteEditor";
 import { TodoList } from "./TodoList";
 import { folderTree } from "../schema";
+import { useIsMobile } from "./useIsMobile";
 
 export function App() {
   const [token, setTok] = useState<string | null>(getToken());
@@ -49,6 +50,24 @@ function Workspace({ token, onLogout }: { token: string; onLogout: () => void })
 
   const tree = useMemo(() => folderTree(snap.notes), [snap.notes]);
   const selected = snap.notes.find((n) => n.id === selectedId) ?? null;
+  const isMobile = useIsMobile();
+
+  // Mobile: editing a note takes over the whole screen (its own back/save
+  // bar; no app chrome) so there's room to write on a phone.
+  if (isMobile && snap.adopted && tab === "notes" && selected) {
+    return (
+      <div className="app">
+        <NoteEditor
+          key={selected.id}
+          store={store}
+          note={selected}
+          mobile
+          onBack={() => setSelectedId(null)}
+          onDeleted={() => setSelectedId(null)}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="app">
