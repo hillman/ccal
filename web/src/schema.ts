@@ -135,6 +135,23 @@ export function folderTree(notes: NoteView[]): FolderNode {
 
 const now = () => new Automerge.Int(Date.now());
 
+// `crypto.randomUUID` only exists in a secure context (https / localhost), but
+// the app is often reached over plain http on the LAN/Tailscale — where it's
+// undefined. `getRandomValues` is available everywhere, so build a v4-shaped id
+// from it. Ids are just opaque map keys; any unique string works.
+function newId(): string {
+  const c = globalThis.crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  if (c?.getRandomValues) {
+    const b = c.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const h = [...b].map((x) => x.toString(16).padStart(2, "0"));
+    return `${h.slice(0, 4).join("")}-${h.slice(4, 6).join("")}-${h.slice(6, 8).join("")}-${h.slice(8, 10).join("")}-${h.slice(10, 16).join("")}`;
+  }
+  return `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 // Automerge.Text.insertAt takes chars as varargs; chunk large inserts so a
 // big paste can't blow the call-stack / argument limit.
 function insertChars(body: Automerge.Text, pos: number, chars: string[]) {
@@ -145,7 +162,7 @@ function insertChars(body: Automerge.Text, pos: number, chars: string[]) {
 }
 
 export function createNote(doc: Doc, folder: string[], title: string): [Doc, string] {
-  const id = crypto.randomUUID();
+  const id = newId();
   const ts = now();
   const next = Automerge.change(doc, (d: any) => {
     d.notes[id] = {
@@ -218,7 +235,7 @@ export function setNoteBody(doc: Doc, id: string, next: string): Doc {
 }
 
 export function addTodo(doc: Doc, text: string): [Doc, string] {
-  const id = crypto.randomUUID();
+  const id = newId();
   const orders = readTodos(doc).map((t) => t.order);
   const order = orders.length ? Math.max(...orders) + 1 : 1; // mirror add_todo
   const next = Automerge.change(doc, (d: any) => {
