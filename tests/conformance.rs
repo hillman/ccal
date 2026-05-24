@@ -18,7 +18,8 @@ fn js_written_doc_matches_rust_read() {
     };
     let store = Store::open_at(&path).expect("open server replica");
 
-    // Note: title (Str), folder (List<Str>) and body (Text) as written by JS.
+    // Note: title (Str), folder (List<Str>) and body (List<Str>, one element
+    // per line) as written by JS.
     let metas = store.note_metas();
     let meta = metas
         .iter()
@@ -35,7 +36,7 @@ fn js_written_doc_matches_rust_read() {
         "folder List<Str> mismatch",
     );
     let note = store.note(&meta.id).expect("full read of JS note");
-    assert_eq!(note.body, "alpha bravo", "body Text mismatch");
+    assert_eq!(note.body, "alpha\nbravo", "body List<Str> mismatch");
 
     // Todos: the fractional reorder (move "third" to front) must yield the
     // same order the Rust `todos()` sort produces.

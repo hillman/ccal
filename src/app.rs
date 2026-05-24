@@ -191,13 +191,36 @@ pub struct App {
 
 impl App {
     pub fn new() -> Result<Self> {
-        let store = Arc::new(Mutex::new(Store::open()?));
-
         // Standalone unless both a URL and a token resolve (env var or
         // config file, env winning). No URL/token → no sync thread, same
         // code path otherwise.
         let cfg = ccal::Config::load()?;
-        let sync = match (cfg.client_url(), cfg.client_token()) {
+        let url = cfg.client_url();
+        let token = cfg.client_token();
+        let synced = url.is_some() && token.is_some();
+
+        // Handle a pre-line-body (schema 1) local replica before opening it.
+        // A synced client must NOT push its old per-character history back
+        // onto the migrated server, so it discards the cache (kept as a
+        // `.v1.bak`) and re-syncs the small new doc. A standalone client has
+        // no server to re-pull from, so it migrates in place instead.
+        let path = Store::default_path()?;
+        if Store::needs_migration(&path)? {
+            if synced {
+                let bak = path.with_extension("automerge.v1.bak");
+                if bak.exists() {
+                    std::fs::remove_file(&path)?;
+                } else {
+                    std::fs::rename(&path, &bak)?;
+                }
+            } else {
+                Store::migrate_v1_in_place(&path)?;
+            }
+        }
+
+        let store = Arc::new(Mutex::new(Store::open()?));
+
+        let sync = match (url, token) {
             (Some(url), Some(token)) => {
                 Some(sync_client::spawn(store.clone(), url, token))
             }

@@ -43,3 +43,19 @@ export async function saveDoc(key: string, bytes: Uint8Array): Promise<void> {
     db.close();
   }
 }
+
+/** Drop a cached doc — used when a stale (pre-schema-bump) replica must be
+ *  discarded and re-pulled fresh from the server rather than synced. */
+export async function deleteDoc(key: string): Promise<void> {
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}

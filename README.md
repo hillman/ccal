@@ -33,8 +33,9 @@ at a glance.
   everything else.
 - **Offline-first sync, no conflicts.** The store *is* a CRDT (Automerge):
   every device works fully offline and converges automatically, with
-  **character-level merge** of concurrent edits to the same note — edits
-  are never lost and there are no conflict markers.
+  **line-level merge** of concurrent edits to the same note — edits to
+  different lines both survive and there are no conflict markers (two
+  devices editing the *same* line resolve last-writer-wins).
 - **Run-your-own sync server.** `ccal-server` is a tiny always-on peer:
   point any number of clients at it; it merges, **rebroadcasts changes
   live**, and doubles as a free plaintext backup. No database, no schema,

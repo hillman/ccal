@@ -21,8 +21,9 @@ iOS is built and tested).
 
 **Scope change 2026-05-17 — note *body* editing is now IN.** Originally
 listed out of scope. Reversed deliberately: `Store::set_note_body` already
-splices at character granularity, so an edit from the phone CRDT-merges
-with a concurrent TUI edit exactly as the TUI's own editing does — the
+splices at line granularity (schema 2; was per-character), so an edit from
+the phone CRDT-merges with a concurrent TUI edit to a different line exactly
+as the TUI's own editing does — the
 objection was product surface, not safety, and the capture-and-glance app
 is more useful if a glanced note can be corrected in place. The durability
 rule is **extended to edits** (set_note_body → save() synchronously before

@@ -8,7 +8,7 @@ import * as Automerge from "@automerge/automerge";
 import { connect, type SyncConn, type ConnStatus } from "./sync";
 import type { Doc, NoteView, TodoView } from "./schema";
 import * as S from "./schema";
-import { loadDoc, saveDoc } from "./storage";
+import { loadDoc, saveDoc, deleteDoc } from "./storage";
 import { DOC_ID } from "./config";
 
 export interface Snapshot {
@@ -41,8 +41,16 @@ export class Store {
     try {
       const bytes = await loadDoc(DOC_ID);
       if (bytes) {
-        this.doc = Automerge.merge(this.doc, Automerge.load(bytes) as Doc);
-        this.recompute();
+        const cached = Automerge.load(bytes) as Doc;
+        // Discard a pre-line-body (schema < 2) cache instead of merging it:
+        // syncing its per-character history would re-bloat the migrated
+        // server. Drop it and re-pull the small new doc fresh.
+        if (S.schemaOf(cached) >= S.SCHEMA_VERSION) {
+          this.doc = Automerge.merge(this.doc, cached);
+          this.recompute();
+        } else {
+          await deleteDoc(DOC_ID);
+        }
       }
     } catch {
       /* a corrupt/absent cache is not fatal — sync will repopulate */

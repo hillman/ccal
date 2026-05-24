@@ -68,8 +68,13 @@ ROOT map:
   doc before relying on sync.
 - **Identity** is app-owned UUID v4 (`models::new_id`). External keys
   (Bear's) are deliberately never reused.
-- **`body` is an Automerge `Text` object** (per-character CRDT) so
-  concurrent edits to the same note merge at character granularity.
+- **`body` is an Automerge `List<Str>`** — one element per line. Concurrent
+  edits to *different* lines merge; the *same* line resolves last-writer-wins.
+  (Was a per-character `Text` CRDT through schema 1; changed to lines in
+  schema 2 because char-level cost O(every character in the corpus) at load —
+  ~800 K ops / ~1.2 s in WASM — vs O(lines), ~30× fewer ops. Edits splice
+  only the changed line range; `Store::migrate_v1_in_place` re-genesises an
+  old replica, dropping the old `Text` op history.)
 - **Folders** are derived: a note at `["a","b"]` appears under `a/b`.
   Deleting a folder = deleting the notes in it; there is no folder object.
 - **Todo order**: fractional `order: f64`; reorder swaps two todos' keys
@@ -119,9 +124,12 @@ ROOT map:
 
 ## Critical performance constraint
 
-Automerge's per-char `Text` CRDT is **~1000× slower in a debug build**. A
-644-note import never completes under `cargo build`; under
-`--release` it takes ~0.4 s. Therefore:
+Automerge op-processing is **~1000× slower in a debug build**. This was acute
+when `body` was a per-character `Text` (one op per character → ~800 K ops for
+644 notes): import never completed under `cargo build`, and a cold WASM load
+took ~1.2 s. Schema 2's line-based `body: List<Str>` cut that to ~30 K ops
+(~96 ms WASM load), but debug Automerge is still slow enough to matter at
+scale. Therefore:
 
 - **Always run everything — the TUI included — with `--release`.** A debug
   build is unusably slow (adding a note / opening the list takes seconds).
@@ -238,8 +246,8 @@ named snapshot (`Prompt::NewCheckpoint` → `create_checkpoint`).
   field/list writes — they ride the existing Automerge sync path with no
   schema or genesis change (folders are still purely derived). Concurrent
   *rename of the same folder to different names* on two replicas is
-  last-writer-wins per note (notes may split across both names); bodies
-  never lose data (Text CRDT).
+  last-writer-wins per note (notes may split across both names); body edits
+  to different lines still merge (line-level `List<Str>`).
 
 **Note editor is modal (Vim, via edtui).** This is deliberate: app commands
 only fire in the editor's **Normal** mode, so typing in Insert/Visual/Search
@@ -280,7 +288,7 @@ handshake the socket goes non-blocking so the pump also flushes local edits
 promptly. The thread sets a `dirty` flag + a status string; `App::tick()`
 (called once per UI loop, before draw) folds remote changes in via
 `refresh()` — it deliberately does **not** touch an open editor buffer (the
-Text CRDT still merges in the doc; reconciled on next open). Config is env:
+body still merges in the doc line-by-line; reconciled on next open). Config is env:
 `CCAL_SYNC_URL` (e.g. `ws://host:8787/sync/ccal`) + `CCAL_SYNC_TOKEN`; absent
 either ⇒ standalone, same code path, no thread.
 

@@ -15,7 +15,11 @@ import * as Automerge from "@automerge/automerge";
 
 export type Doc = Automerge.Doc<CcalDoc>;
 
-export const SCHEMA_VERSION = 1;
+// Bumped 1 -> 2 when `body` changed from a per-character `Text` CRDT to a
+// `List<Str>` of lines (see src/store.rs). A cached doc below this version is
+// discarded on boot (store.ts) rather than synced, so its old history is not
+// pushed back onto the migrated server.
+export const SCHEMA_VERSION = 2;
 
 export interface CcalDoc {
   schema: number;
@@ -24,8 +28,11 @@ export interface CcalDoc {
 }
 export interface NoteFields {
   title: string;
+  // One element per line (mirrors store.rs `body: List<Str>`). Read side may
+  // still see a legacy `Text`/string from an un-migrated cache; `bodyToString`
+  // tolerates both.
   folder: string[];
-  body: Automerge.Text | string;
+  body: string[];
   created: number;
   modified: number;
   private?: boolean;
@@ -62,9 +69,22 @@ export function isAdopted(doc: Doc): boolean {
   return d.schema === SCHEMA_VERSION && !!d.notes && !!d.todos;
 }
 
-function bodyToString(b: Automerge.Text | string | undefined): string {
+/** The doc's on-disk schema version (0 if absent) — boot uses it to decide
+ *  whether a cached replica predates the line-based body schema. */
+export function schemaOf(doc: Doc): number {
+  return Number((doc as unknown as Partial<CcalDoc>).schema ?? 0);
+}
+
+function bodyToString(b: string[] | Automerge.Text | string | undefined): string {
   if (b == null) return "";
-  return typeof b === "string" ? b : b.toString();
+  if (Array.isArray(b)) return b.join("\n"); // List<Str> lines (current)
+  return typeof b === "string" ? b : b.toString(); // legacy Text/string
+}
+
+/** Body string -> line elements. "" -> [] so it round-trips with join("\n")
+ *  and an empty body is an empty list; mirrors store.rs `body_lines`. */
+function bodyLines(s: string): string[] {
+  return s === "" ? [] : s.split("\n");
 }
 
 export function readNotes(doc: Doc): NoteView[] {
@@ -152,12 +172,13 @@ function newId(): string {
   return `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-// Automerge.Text.insertAt takes chars as varargs; chunk large inserts so a
-// big paste can't blow the call-stack / argument limit.
-function insertChars(body: Automerge.Text, pos: number, chars: string[]) {
+// Insert `lines` into the body list at `pos`, chunking so a big paste can't
+// blow the spread/argument limit. Splicing in place (not replacing the array)
+// keeps untouched lines' identity, so a concurrent edit to another line merges.
+function insertLines(body: string[], pos: number, lines: string[]) {
   const CHUNK = 1000;
-  for (let i = 0; i < chars.length; i += CHUNK) {
-    body.insertAt(pos + i, ...chars.slice(i, i + CHUNK));
+  for (let i = 0; i < lines.length; i += CHUNK) {
+    body.splice(pos + i, 0, ...lines.slice(i, i + CHUNK));
   }
 }
 
@@ -168,7 +189,7 @@ export function createNote(doc: Doc, folder: string[], title: string): [Doc, str
     d.notes[id] = {
       title,
       folder: [...folder],
-      body: new Automerge.Text(""),
+      body: [], // empty line list; first edit splices lines in
       created: ts,
       modified: ts,
     };
@@ -208,28 +229,28 @@ export function editNoteBody(doc: Doc, id: string, prev: string, next: string): 
   return Automerge.change(doc, (d: any) => {
     const n = d.notes[id];
     if (!n) return;
-    const body = n.body as Automerge.Text;
-    const diff = textSplice(prev, next);
+    const diff = linesSplice(bodyLines(prev), bodyLines(next));
     if (!diff) return;
     const [pos, del, ins] = diff;
-    if (del > 0) body.deleteAt(pos, del);
-    if (ins.length > 0) insertChars(body, pos, ins);
+    const body = n.body as string[];
+    if (del > 0) body.splice(pos, del);
+    insertLines(body, pos, ins);
     n.modified = now();
   });
 }
 
-/** Reconcile the whole body to `next` by splicing only the changed region
- *  against the doc's current text — mirrors store.rs `set_note_body`. */
+/** Reconcile the whole body to `next` by splicing only the changed lines
+ *  against the doc's current body — mirrors store.rs `set_note_body`. */
 export function setNoteBody(doc: Doc, id: string, next: string): Doc {
   return Automerge.change(doc, (d: any) => {
     const n = d.notes[id];
     if (!n) return;
-    const body = n.body as Automerge.Text;
-    const diff = textSplice(body.toString(), next);
+    const body = n.body as string[];
+    const diff = linesSplice(Array.from(body), bodyLines(next));
     if (!diff) return;
     const [pos, del, ins] = diff;
-    if (del > 0) body.deleteAt(pos, del);
-    if (ins.length > 0) insertChars(body, pos, ins);
+    if (del > 0) body.splice(pos, del);
+    insertLines(body, pos, ins);
     n.modified = now();
   });
 }
@@ -272,17 +293,16 @@ export function reorderTodo(doc: Doc, id: string, toIndex: number): Doc {
   });
 }
 
-/** Minimal (prefix-position, delete-count, insert-chars) edit turning `cur`
- *  into `next`, or null if unchanged. Code-point based, like Rust
- *  `text_splice`. */
-export function textSplice(cur: string, next: string): [number, number, string[]] | null {
-  if (cur === next) return null;
-  const a = [...cur];
-  const b = [...next];
-  const max = Math.min(a.length, b.length);
+/** Minimal (prefix-position, delete-count, inserted-lines) edit turning
+ *  `cur` lines into `next` lines, or null if unchanged. Line analogue of
+ *  Rust `lines_splice`: keeps unchanged leading/trailing lines so a
+ *  concurrent edit to a different line still merges. */
+export function linesSplice(cur: string[], next: string[]): [number, number, string[]] | null {
   let p = 0;
-  while (p < max && a[p] === b[p]) p++;
+  while (p < cur.length && p < next.length && cur[p] === next[p]) p++;
   let s = 0;
-  while (s < max - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
-  return [p, a.length - p - s, b.slice(p, b.length - s)];
+  while (s < cur.length - p && s < next.length - p && cur[cur.length - 1 - s] === next[next.length - 1 - s]) s++;
+  const del = cur.length - p - s;
+  const ins = next.slice(p, next.length - s);
+  return del === 0 && ins.length === 0 ? null : [p, del, ins];
 }

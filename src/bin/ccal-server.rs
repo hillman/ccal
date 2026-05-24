@@ -221,6 +221,18 @@ async fn doc_for(app: &Arc<App>, docid: &str) -> Result<Arc<Doc>> {
         return Ok(d.clone());
     }
     let path = app.data_dir.join(format!("{docid}.automerge"));
+    // Auto-migrate a pre-line-body (schema 1) replica before opening it. The
+    // server is authoritative: it re-genesises in place to shed the old
+    // per-character `Text` op history (keeping a `.v1.bak`); clients detect
+    // the bump and discard + re-sync rather than push their old history back.
+    match Store::migrate_v1_in_place(&path) {
+        Ok(true) => eprintln!(
+            "ccal-server: migrated `{docid}` to the line-based body schema \
+             (backup: {docid}.automerge.v1.bak)"
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("ccal-server: migration check for `{docid}` failed: {e:#} (continuing)"),
+    }
     let store = Store::open_at(&path).with_context(|| format!("opening {}", path.display()))?;
     let (changed, _) = broadcast::channel(16);
     let doc = Arc::new(Doc {

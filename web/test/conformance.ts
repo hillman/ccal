@@ -101,7 +101,9 @@ async function main() {
     noteId = id;
     return d2;
   });
-  w.mutate((d) => S.editNoteBody(d, noteId, "", "alpha bravo"));
+  // Multi-line so the body `List<Str>` representation is exercised (not just
+  // a single-element list).
+  w.mutate((d) => S.editNoteBody(d, noteId, "", "alpha\nbravo"));
   w.mutate((d) => S.setNoteTitle(d, noteId, "P1 note edited"));
 
   const todoIds: string[] = [];
@@ -124,7 +126,7 @@ async function main() {
   const notes = S.readNotes(r.getDoc());
   const note = notes.find((n) => n.id === noteId) ?? die("note not synced to reader");
   assert(note.title === "P1 note edited", `title mismatch: ${note.title}`);
-  assert(note.body === "alpha bravo", `body mismatch: ${JSON.stringify(note.body)}`);
+  assert(note.body === "alpha\nbravo", `body mismatch: ${JSON.stringify(note.body)}`);
   assert(note.folder.join("/") === "work/proj", `folder mismatch: ${note.folder}`);
 
   const tree = S.folderTree(notes);

@@ -7,13 +7,21 @@
 //! single transaction over all notes (doing it per-note through the
 //! convenience `AutoCommit` wrapper is pathologically slow at scale).
 //!
-//! `body` is a real Automerge `Text` object, so concurrent edits to the
-//! same note merge at character granularity. Interactive edits splice only
-//! the changed prefix/suffix region; import inserts the whole body in one op.
+//! `body` is an Automerge `List<Str>` — one element per *line*. Concurrent
+//! edits to *different* lines of the same note merge; two edits to the *same*
+//! line resolve last-writer-wins. This is deliberately coarser than a
+//! per-character `Text` CRDT: char-level cost O(every character in the
+//! corpus) at load (a sequence CRDT stores one op per character, so loading
+//! ~800 KB of notes meant materializing ~800 K ops, ~1.2 s in WASM), whereas
+//! line-level is O(lines) — ~30× fewer ops, ~24× faster load — while still
+//! merging the realistic case (different lines changed on different devices).
+//! Interactive edits splice only the changed line range so untouched lines
+//! keep their identity and still merge. (Schema bumped 1→2 for this; see
+//! `Store::migrate_v1_in_place`.)
 //!
 //! Document layout (ROOT map):
 //! - `schema`: Int
-//! - `notes`:  Map  id -> { title:Str, folder:List<Str>, body:Text,
+//! - `notes`:  Map  id -> { title:Str, folder:List<Str>, body:List<Str>,
 //!                           created:Int, modified:Int }
 //! - `todos`:  Map  id -> { text:Str, order:F64, created:Int,
 //!                           tags:List<Str>? (absent = none) }
@@ -43,7 +51,7 @@ use crate::models::{
     Todo,
 };
 
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 
 /// Prefix for the per-calendar ROOT keys (`cal/<uuid>`). See [`Store`] doc:
 /// each subscription is its own `ROOT` entry, not a child of a shared
@@ -129,6 +137,13 @@ impl Store {
         Self::open_at(data_path()?)
     }
 
+    /// The default on-disk replica path (`<data dir>/ccal.automerge`) — so a
+    /// caller can run [`Store::needs_migration`] / [`Store::migrate_v1_in_place`]
+    /// against it before [`Store::open`].
+    pub fn default_path() -> Result<PathBuf> {
+        data_path()
+    }
+
     /// Open the store from an explicit path (used by the sync server, which
     /// keeps its replica outside the interactive client's data dir),
     /// creating an empty document if absent.
@@ -185,6 +200,130 @@ impl Store {
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path).context("replacing store file")?;
         Ok(())
+    }
+
+    // ---- Migration -----------------------------------------------------
+
+    /// The on-disk `schema` of the document at `path`, or `None` if the file
+    /// is absent. Loads the whole document (the only way to read a value), so
+    /// it is as costly as an `open` — fine for a once-per-launch check.
+    pub fn file_schema(path: impl AsRef<Path>) -> Result<Option<i64>> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let doc = Automerge::load(&bytes).context("parsing Automerge document")?;
+        Ok(Some(read_schema(&doc)))
+    }
+
+    /// `true` if the document at `path` predates the current schema and a
+    /// client should reset (discard + re-sync) rather than push its old
+    /// history back onto a migrated server. `false` for an absent or
+    /// already-current file.
+    pub fn needs_migration(path: impl AsRef<Path>) -> Result<bool> {
+        Ok(Self::file_schema(path)?.is_some_and(|s| s < SCHEMA))
+    }
+
+    /// Re-genesis a pre-line-body replica in place.
+    ///
+    /// A schema-1 document stores each `body` as a per-character `Text`, so it
+    /// carries one op per character ever typed — the load-time cost this whole
+    /// change exists to remove. Automerge never forgets ops, so the only way
+    /// to shed them is to mint a *fresh* document: this builds a new genesis
+    /// doc with `body` as a `List<Str>` of lines, copying every note, todo,
+    /// calendar subscription and mark across **by id** (so marks and external
+    /// references stay valid). Edit history and checkpoints are intentionally
+    /// dropped — they are exactly the op history we are discarding.
+    ///
+    /// The original file is kept as `<name>.v1.bak`. Returns `Ok(true)` if a
+    /// migration ran, `Ok(false)` if the file is absent or already current
+    /// (idempotent). Server-authoritative: clients should `needs_migration` →
+    /// discard + re-sync instead of migrating independently, so this change's
+    /// non-deterministic commit never has to converge with another replica's.
+    pub fn migrate_v1_in_place(path: impl AsRef<Path>) -> Result<bool> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(false);
+        }
+        // Load once and gate on the in-memory schema (loading an old replica
+        // is the costly part — don't do it twice).
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let old = Automerge::load(&bytes).context("parsing v1 document")?;
+        if read_schema(&old) >= SCHEMA {
+            return Ok(false);
+        }
+        let mut doc = genesis_doc();
+        doc.set_actor(ActorId::random());
+        let notes = child(&doc, &ROOT, "notes").context("genesis notes")?;
+        let todos = child(&doc, &ROOT, "todos").context("genesis todos")?;
+
+        let mut tx = doc.transaction();
+        if let Some(on) = child(&old, &ROOT, "notes") {
+            for id in old.keys(&on) {
+                let Some(o) = child(&old, &on, &id) else { continue };
+                // The OLD body is a `Text`; read it as text, store as lines.
+                let body = child(&old, &o, "body")
+                    .and_then(|b| old.text(&b).ok())
+                    .unwrap_or_default();
+                let obj = tx.put_object(&notes, id.as_str(), ObjType::Map)?;
+                tx.put(&obj, "title", get_str(&old, &o, "title").as_str())?;
+                tx.put(&obj, "created", get_i64(&old, &o, "created"))?;
+                tx.put(&obj, "modified", get_i64(&old, &o, "modified"))?;
+                if get_bool(&old, &o, "private") {
+                    tx.put(&obj, "private", true)?;
+                }
+                let bl = tx.put_object(&obj, "body", ObjType::List)?;
+                insert_lines(&mut tx, &bl, 0, &body_lines(&body))?;
+                let fl = tx.put_object(&obj, "folder", ObjType::List)?;
+                insert_lines(&mut tx, &fl, 0, &get_folder(&old, &o))?;
+            }
+        }
+        if let Some(ot) = child(&old, &ROOT, "todos") {
+            for id in old.keys(&ot) {
+                let Some(o) = child(&old, &ot, &id) else { continue };
+                let obj = tx.put_object(&todos, id.as_str(), ObjType::Map)?;
+                tx.put(&obj, "text", get_str(&old, &o, "text").as_str())?;
+                tx.put(&obj, "order", get_f64(&old, &o, "order"))?;
+                tx.put(&obj, "created", get_i64(&old, &o, "created"))?;
+                let tags = str_list(&old, &o, "tags", At::Now);
+                if !tags.is_empty() {
+                    let tl = tx.put_object(&obj, "tags", ObjType::List)?;
+                    insert_lines(&mut tx, &tl, 0, &tags)?;
+                }
+            }
+        }
+        // Calendars (`cal/<id>` maps) and marks (`mark/<char>` scalars) live
+        // straight on ROOT; copy them verbatim so subscriptions/bookmarks
+        // survive the re-genesis.
+        for k in old.keys(ROOT) {
+            if k.starts_with(CAL_PREFIX) {
+                if let Some(o) = child(&old, &ROOT, &k) {
+                    let obj = tx.put_object(ROOT, k.as_str(), ObjType::Map)?;
+                    tx.put(&obj, "url", get_str(&old, &o, "url").as_str())?;
+                    tx.put(&obj, "name", get_str(&old, &o, "name").as_str())?;
+                    tx.put(&obj, "created", get_i64(&old, &o, "created"))?;
+                }
+            } else if k.starts_with(MARK_PREFIX) {
+                let v = get_str(&old, &ROOT, &k);
+                if !v.is_empty() {
+                    tx.put(ROOT, k.as_str(), v.as_str())?;
+                }
+            }
+        }
+        commit(tx);
+
+        // Write the new doc, then move the original aside (first backup wins,
+        // so re-running can't clobber the pristine v1 copy).
+        let new_bytes = doc.save();
+        let tmp = path.with_extension("automerge.tmp");
+        std::fs::write(&tmp, &new_bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        let bak = path.with_extension("automerge.v1.bak");
+        if !bak.exists() {
+            std::fs::rename(path, &bak).context("backing up v1 replica")?;
+        }
+        std::fs::rename(&tmp, path).context("installing migrated replica")?;
+        Ok(true)
     }
 
     // ---- Sync ----------------------------------------------------------
@@ -313,7 +452,7 @@ impl Store {
                 let body = (!meta_hit && (!private || include_private_bodies))
                     .then(|| {
                         child(&self.doc, &obj, "body")
-                            .and_then(|b| self.doc.text(&b).ok())
+                            .map(|b| list_strs(&self.doc, &b, At::Now).join("\n"))
                     })
                     .flatten();
                 let body_hit = body
@@ -388,7 +527,8 @@ impl Store {
         tx.put(&obj, "title", title)?;
         tx.put(&obj, "created", ts)?;
         tx.put(&obj, "modified", ts)?;
-        tx.put_object(&obj, "body", ObjType::Text)?;
+        // Empty body = empty line list; the first edit splices lines in.
+        tx.put_object(&obj, "body", ObjType::List)?;
         let list = tx.put_object(&obj, "folder", ObjType::List)?;
         for (i, c) in folder.iter().enumerate() {
             tx.insert(&list, i, c.as_str())?;
@@ -398,7 +538,7 @@ impl Store {
     }
 
     /// Bulk-import notes in a single transaction (the only fast path at
-    /// scale). The whole body goes in as one splice op per note.
+    /// scale). The body goes in as one list element per line.
     pub fn import_notes(
         &mut self,
         items: &[NoteInput],
@@ -411,10 +551,8 @@ impl Store {
             tx.put(&obj, "title", n.title.as_str())?;
             tx.put(&obj, "created", n.created)?;
             tx.put(&obj, "modified", n.modified)?;
-            let body = tx.put_object(&obj, "body", ObjType::Text)?;
-            if !n.body.is_empty() {
-                tx.splice_text(&body, 0, 0, &n.body)?;
-            }
+            let body = tx.put_object(&obj, "body", ObjType::List)?;
+            insert_lines(&mut tx, &body, 0, &body_lines(&n.body))?;
             let list = tx.put_object(&obj, "folder", ObjType::List)?;
             for (i, c) in n.folder.iter().enumerate() {
                 tx.insert(&list, i, c.as_str())?;
@@ -459,19 +597,20 @@ impl Store {
         Ok(())
     }
 
-    /// Update the note body, splicing only the changed region so concurrent
-    /// edits merge at character granularity.
+    /// Update the note body, splicing only the changed *lines* so a
+    /// concurrent edit to a different line still merges.
     pub fn set_note_body(&mut self, id: &str, new: &str) -> Result<()> {
         let obj = child(&self.doc, &self.notes, id).ok_or_else(|| anyhow!("no such note"))?;
         let body = child(&self.doc, &obj, "body")
             .ok_or_else(|| anyhow!("note has no body object"))?;
 
-        let cur = self.doc.text(&body)?;
-        let Some((p, del, ins)) = text_splice(&cur, new) else {
+        let cur = list_strs(&self.doc, &body, At::Now);
+        let Some((p, del, ins)) = lines_splice(&cur, &body_lines(new)) else {
             return Ok(());
         };
         let mut tx = self.doc.transaction();
-        tx.splice_text(&body, p, del as isize, &ins)?;
+        delete_lines(&mut tx, &body, p, del)?;
+        insert_lines(&mut tx, &body, p, &ins)?;
         tx.put(&obj, "modified", now_ms())?;
         commit(tx);
         Ok(())
@@ -1078,15 +1217,18 @@ impl Store {
             for (i, c) in n.folder.iter().enumerate() {
                 tx.insert(&fl, i, c.as_str())?;
             }
-            // Splice only the changed region so a concurrent character
-            // edit still merges, exactly like `set_note_body`.
+            // Splice only the changed lines so a concurrent edit to another
+            // line still merges, exactly like `set_note_body`.
             let body = match tx.get(&obj, "body")? {
-                Some((Value::Object(_), b)) => b,
-                _ => tx.put_object(&obj, "body", ObjType::Text)?,
+                Some((Value::Object(ObjType::List), b)) => b,
+                // Missing or a legacy `Text` body (pre-migration history a
+                // restore can reach) → (re)create as the line list.
+                _ => tx.put_object(&obj, "body", ObjType::List)?,
             };
-            let cur = tx.text(&body)?;
-            if let Some((p, del, ins)) = text_splice(&cur, &n.body) {
-                tx.splice_text(&body, p, del as isize, &ins)?;
+            let cur = list_strs(&tx, &body, At::Now);
+            if let Some((p, del, ins)) = lines_splice(&cur, &body_lines(&n.body)) {
+                delete_lines(&mut tx, &body, p, del)?;
+                insert_lines(&mut tx, &body, p, &ins)?;
             }
         }
 
@@ -1213,14 +1355,6 @@ fn akeys<D: ReadDoc>(d: &D, obj: &ObjId, at: At) -> Vec<String> {
     }
 }
 
-fn atext<D: ReadDoc>(d: &D, obj: &ObjId, at: At) -> String {
-    match at {
-        At::Now => d.text(obj),
-        At::Heads(h) => d.text_at(obj, h),
-    }
-    .unwrap_or_default()
-}
-
 fn alen<D: ReadDoc>(d: &D, list: &ObjId, at: At) -> usize {
     match at {
         At::Now => d.length(list),
@@ -1300,6 +1434,11 @@ fn as_bool(v: Option<(Value<'_>, ObjId)>) -> bool {
     matches!(v, Some((Value::Scalar(s), _)) if matches!(s.as_ref(), ScalarValue::Boolean(true)))
 }
 
+/// `ROOT["schema"]` as an integer (0 if absent) — the migration gate.
+fn read_schema<D: ReadDoc>(d: &D) -> i64 {
+    as_i64(aget(d, &ROOT, "schema", At::Now))
+}
+
 // Ergonomic live-read wrappers — every existing call site stays unchanged;
 // they're the `At::Now` case of the unified readers above.
 fn child<D: ReadDoc>(d: &D, parent: &ObjId, key: &str) -> Option<ObjId> {
@@ -1321,15 +1460,12 @@ fn get_folder<D: ReadDoc>(d: &D, note_obj: &ObjId) -> Vec<String> {
     folder(d, note_obj, At::Now)
 }
 
-/// Read a `List<Str>` field (skipping any non-string element). The single
-/// definition behind a note's `folder` and a todo's `tags`; works for both
-/// live (`At::Now`) and at-heads restore reads.
-fn str_list<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, at: At) -> Vec<String> {
-    let Some(list) = as_obj(aget(d, obj, key, at)) else {
-        return Vec::new();
-    };
-    (0..alen(d, &list, at))
-        .filter_map(|i| match aget(d, &list, i, at) {
+/// Read every string element of a `List<Str>` *object* (skipping any
+/// non-string element). The shared core of a note's `body`/`folder` and a
+/// todo's `tags`; works live (`At::Now`) and at-heads (restore).
+fn list_strs<D: ReadDoc>(d: &D, list: &ObjId, at: At) -> Vec<String> {
+    (0..alen(d, list, at))
+        .filter_map(|i| match aget(d, list, i, at) {
             Some((Value::Scalar(s), _)) => match s.as_ref() {
                 ScalarValue::Str(s) => Some(s.to_string()),
                 _ => None,
@@ -1337,6 +1473,14 @@ fn str_list<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, at: At) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Read a named `List<Str>` *field* (note `folder`, todo `tags`).
+fn str_list<D: ReadDoc>(d: &D, obj: &ObjId, key: &str, at: At) -> Vec<String> {
+    match as_obj(aget(d, obj, key, at)) {
+        Some(list) => list_strs(d, &list, at),
+        None => Vec::new(),
+    }
 }
 
 fn folder<D: ReadDoc>(d: &D, note_obj: &ObjId, at: At) -> Vec<String> {
@@ -1359,7 +1503,7 @@ fn note_view<D: ReadDoc>(d: &D, notes: &ObjId, id: &str, at: At) -> Option<Note>
         title: as_str(aget(d, &obj, "title", at)),
         folder: folder(d, &obj, at),
         body: as_obj(aget(d, &obj, "body", at))
-            .map(|b| atext(d, &b, at))
+            .map(|b| list_strs(d, &b, at).join("\n"))
             .unwrap_or_default(),
         created: as_i64(aget(d, &obj, "created", at)),
         modified: as_i64(aget(d, &obj, "modified", at)),
@@ -1390,31 +1534,55 @@ fn all_todos<D: ReadDoc>(d: &D, todos: &ObjId, at: At) -> Vec<Todo> {
         .collect()
 }
 
-/// Minimal `(pos, delete_count, insert)` to turn `old` into `new`, or
-/// `None` if identical. Char-indexed to line up with Automerge's `Text`
-/// splice; shared by `set_note_body` and checkpoint restore so both keep
-/// concurrent character-level merges.
-fn text_splice(old: &str, new: &str) -> Option<(usize, usize, String)> {
-    let old: Vec<char> = old.chars().collect();
-    let newc: Vec<char> = new.chars().collect();
+/// Split a body string into its line elements. Empty body → no lines; a
+/// trailing newline yields a trailing empty line, so `body_lines` and
+/// `join("\n")` round-trip exactly.
+fn body_lines(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split('\n').map(str::to_string).collect()
+    }
+}
+
+/// Minimal `(pos, delete_count, inserted)` turning `old` lines into `new`
+/// lines, or `None` if identical. Line analogue of a prefix/suffix text
+/// splice: keeps unchanged leading/trailing lines so a concurrent edit to a
+/// *different* line still merges. Shared by `set_note_body` and restore.
+fn lines_splice(old: &[String], new: &[String]) -> Option<(usize, usize, Vec<String>)> {
     let mut p = 0;
-    while p < old.len() && p < newc.len() && old[p] == newc[p] {
+    while p < old.len() && p < new.len() && old[p] == new[p] {
         p += 1;
     }
     let mut s = 0;
-    while s < old.len() - p
-        && s < newc.len() - p
-        && old[old.len() - 1 - s] == newc[newc.len() - 1 - s]
+    while s < old.len() - p && s < new.len() - p && old[old.len() - 1 - s] == new[new.len() - 1 - s]
     {
         s += 1;
     }
     let del = old.len() - p - s;
-    let ins: String = newc[p..newc.len() - s].iter().collect();
+    let ins = new[p..new.len() - s].to_vec();
     if del == 0 && ins.is_empty() {
         None
     } else {
         Some((p, del, ins))
     }
+}
+
+/// Delete `count` consecutive list elements starting at `pos` (each delete
+/// at the same index shifts the run down).
+fn delete_lines<T: Transactable>(tx: &mut T, list: &ObjId, pos: usize, count: usize) -> Result<()> {
+    for _ in 0..count {
+        tx.delete(list, pos)?;
+    }
+    Ok(())
+}
+
+/// Insert `lines` as consecutive list elements beginning at `pos`.
+fn insert_lines<T: Transactable>(tx: &mut T, list: &ObjId, pos: usize, lines: &[String]) -> Result<()> {
+    for (i, line) in lines.iter().enumerate() {
+        tx.insert(list, pos + i, line.as_str())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1455,13 +1623,98 @@ mod tests {
         assert_eq!(b.note(&id).map(|n| n.title), Some("from A".to_string()));
 
         // Concurrent edits on each side, then a round trip: both converge
-        // and neither edit is lost (char-level Text merge).
+        // and neither edit is lost (the body edit and the new todo touch
+        // different objects).
         a.set_note_body(&id, "alpha").unwrap();
         let id2 = b.add_todo("from B").unwrap();
         sync(&mut a, &mut b);
         assert_eq!(a.note(&id).map(|n| n.body), Some("alpha".to_string()));
         assert!(b.todos().iter().any(|t| t.id == id2 && t.text == "from B"));
         assert!(a.todos().iter().any(|t| t.id == id2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_level_body_merges() {
+        let dir = std::env::temp_dir().join(format!("ccal-linetest-{}", std::process::id()));
+        let mut a = Store::open_at(dir.join("a.automerge")).unwrap();
+        let mut b = Store::open_at(dir.join("b.automerge")).unwrap();
+
+        // Shared three-line note.
+        let id = a.create_note(&[], "n").unwrap();
+        a.set_note_body(&id, "one\ntwo\nthree").unwrap();
+        sync(&mut a, &mut b);
+        assert_eq!(b.note(&id).unwrap().body, "one\ntwo\nthree");
+
+        // Concurrent edits to DIFFERENT lines: a rewrites line 1, b rewrites
+        // line 3. After sync both survive — the untouched lines kept their
+        // identity, so this is a real merge, not last-writer-wins.
+        a.set_note_body(&id, "ONE\ntwo\nthree").unwrap();
+        b.set_note_body(&id, "one\ntwo\nTHREE").unwrap();
+        sync(&mut a, &mut b);
+        assert_eq!(a.note(&id).unwrap().body, "ONE\ntwo\nTHREE");
+        assert_eq!(b.note(&id).unwrap().body, a.note(&id).unwrap().body);
+
+        // A trailing newline round-trips (it's a trailing empty line).
+        a.set_note_body(&id, "ONE\ntwo\nTHREE\n").unwrap();
+        sync(&mut a, &mut b);
+        assert_eq!(b.note(&id).unwrap().body, "ONE\ntwo\nTHREE\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_v1_text_body_to_line_list() {
+        let dir = std::env::temp_dir().join(format!("ccal-migtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ccal.automerge");
+
+        // Hand-build a schema-1 replica: bodies as per-character `Text`.
+        {
+            let actor: ActorId = "cca100000000cca100000000".parse().unwrap();
+            let mut doc = Automerge::new().with_actor(actor);
+            let mut tx = doc.transaction();
+            tx.put(ROOT, "schema", 1i64).unwrap();
+            let notes = tx.put_object(ROOT, "notes", ObjType::Map).unwrap();
+            tx.put_object(ROOT, "todos", ObjType::Map).unwrap();
+            let n = tx.put_object(&notes, "note-1", ObjType::Map).unwrap();
+            tx.put(&n, "title", "kept").unwrap();
+            tx.put(&n, "created", 111i64).unwrap();
+            tx.put(&n, "modified", 222i64).unwrap();
+            let body = tx.put_object(&n, "body", ObjType::Text).unwrap();
+            tx.splice_text(&body, 0, 0, "line one\nline two").unwrap();
+            let fl = tx.put_object(&n, "folder", ObjType::List).unwrap();
+            tx.insert(&fl, 0, "work").unwrap();
+            // A mark pointing at the note must survive the re-genesis.
+            tx.put(ROOT, "mark/a", "note-1").unwrap();
+            tx.commit_with(CommitOptions::default().with_time(0));
+            std::fs::write(&path, doc.save()).unwrap();
+        }
+
+        assert_eq!(Store::file_schema(&path).unwrap(), Some(1));
+        assert!(Store::needs_migration(&path).unwrap());
+
+        // Migrate, then it is current and idempotent.
+        assert!(Store::migrate_v1_in_place(&path).unwrap());
+        assert!(!Store::migrate_v1_in_place(&path).unwrap(), "second run is a no-op");
+        assert_eq!(Store::file_schema(&path).unwrap(), Some(SCHEMA));
+        assert!(path.with_extension("automerge.v1.bak").exists(), "v1 backed up");
+
+        // Content preserved (id, title, folder, body text, mark).
+        let store = Store::open_at(&path).unwrap();
+        let n = store.note("note-1").expect("note kept by id");
+        assert_eq!(n.title, "kept");
+        assert_eq!(n.body, "line one\nline two");
+        assert_eq!(n.folder, vec!["work".to_string()]);
+        assert_eq!(n.created, 111);
+        assert_eq!(store.mark('a').as_deref(), Some("note-1"));
+
+        // A fresh v2 client converges with the migrated replica.
+        let mut server = Store::open_at(&path).unwrap();
+        let mut client = Store::open_at(dir.join("client.automerge")).unwrap();
+        sync(&mut server, &mut client);
+        assert_eq!(client.note("note-1").map(|n| n.body), Some("line one\nline two".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
